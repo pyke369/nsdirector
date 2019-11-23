@@ -1,0 +1,11 @@
+nsdirector
+support/bench
+local
+remote
+conf/*.pfdb
+conf/*.md5
+debian/nsdirector
+debian/*debhelper*
+debian/*substvars*
+debian/files
+_*
