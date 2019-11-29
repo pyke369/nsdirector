@@ -64,6 +64,7 @@ var (
 	rtypes    = []string{"cname", "a", "aaaa", "loc", "mx", "ptr", "srv", "txt"}
 	pmatcher  = regexp.MustCompile(`^([\-+]*\d+(?:\.\d+)?):([\-+]*(?:\d+\.\d+)?)$`)
 	sqmatcher = regexp.MustCompile(`^([\-+]*\d+(?:\.\d+)?):([\-+]*\d+(?:\.\d+)?)[ /-]([\-+]*\d+(?:\.\d+)?):([\-+]*\d+(?:\.\d+)?)$`)
+	mreplacer = regexp.MustCompile(`\{\{[^\}]*\}\}`)
 )
 
 func parseRecord(rtype, input string, ttl int) (record *RECORD) {
@@ -340,6 +341,7 @@ func response(qname, rtype string, record *RECORD, rfields map[string]string) {
 		}
 		name = strings.ReplaceAll(name, "{{"+key+"}}", value)
 	}
+	name = mreplacer.ReplaceAllString(name, "")
 	switch rtype {
 	case "a", "aaaa", "cname", "ptr":
 		line = fmt.Sprintf("DATA\t%s\t1\t%s\tIN\t%s\t%d\t-1\t%s\n", rfields["bits"], qname, strings.ToUpper(rtype), record.ttl, name)

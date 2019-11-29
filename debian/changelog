@@ -1,3 +1,9 @@
+nsdirector (1.1.1) stable; urgency=medium
+
+  * remove un-expanded macros
+
+ -- Pierre-Yves Kerembellec <py.kerembellec@gmail.com>  Fri, 29 Nov 2019 14:58:07 +0100
+
 nsdirector (1.1.0) stable; urgency=medium
 
   * first production-ready version

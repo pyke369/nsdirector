@@ -10,7 +10,7 @@ import (
 
 var (
 	progname  = "nsdirector"
-	version   = "1.1.0"
+	version   = "1.1.1"
 	retention = 5
 )
 
