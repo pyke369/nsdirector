@@ -33,8 +33,11 @@ pdns: nsdirector
 backend: nsdirector
 	@./nsdirector backend conf/nsdirector.conf
 
+dump: nsdirector
+	@./nsdirector dump conf/nsdirector.conf
+
 request:
-	@dig @192.168.37.128 -p 5353 -t any entry1.domain1.com +subnet=188.65.124.0/24
+	@dig @127.0.0.1 -p 5353 -t any entry1.domain1.com +subnet=78.193.67.0/24
 
 bench: nsdirector
 	@cd support && make bench && cd ..

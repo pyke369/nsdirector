@@ -6,11 +6,13 @@ import (
 	"os"
 	"strconv"
 	"strings"
+
+	"github.com/pyke369/golang-support/uconfig"
 )
 
 var (
 	progname  = "nsdirector"
-	version   = "1.1.1"
+	version   = "1.2.0"
 	retention = 5
 )
 
@@ -28,7 +30,9 @@ func usage(status int) int {
 			"  synchronize <remote> configuration into <target> directory \n"+
 			"  (keep <retention> older versions, default %d)\n\n"+
 			"backend <configuration>\n"+
-			"  start as a PowerDNS pipe backend\n",
+			"  start as a PowerDNS pipe backend\n\n"+
+			"dump <configuration>\n"+
+			"  validate and dump configuration in text/json format\n",
 		progname, retention, retention,
 	)
 	return status
@@ -80,6 +84,18 @@ func main() {
 			os.Exit(1)
 		}
 		backend(os.Args[2])
+
+	case "dump":
+		if len(os.Args) < 3 {
+			fmt.Fprintf(os.Stderr, "missing configuration parameter for dump action - try using \"%s help\"\n", os.Args[1], progname)
+			os.Exit(1)
+		}
+		if config, err := uconfig.New(os.Args[2]); err != nil {
+			fmt.Fprintf(os.Stderr, "%v\n", err)
+			os.Exit(1)
+		} else {
+			fmt.Printf("%s\n", config)
+		}
 
 	default:
 		fmt.Fprintf(os.Stderr, "unknown action \"%s\" - try using \"%s help\"\n", os.Args[1], progname)

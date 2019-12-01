@@ -60,10 +60,14 @@ var (
 	watched   = map[string]string{}
 	domains   = map[string]string{}
 	entries   = map[string][]RULE{}
-	ctypes    = []string{"continent", "country", "asnum", "cidr", "square", "distance", "identity", "time", "latency", "availability"}
+	ctypes    = []string{"continent", "country", "region", "state", "asnum", "cidr", "square", "distance", "identity", "time", "availability", "latency"}
 	rtypes    = []string{"cname", "a", "aaaa", "loc", "mx", "ptr", "srv", "txt"}
-	pmatcher  = regexp.MustCompile(`^([\-+]*\d+(?:\.\d+)?):([\-+]*(?:\d+\.\d+)?)$`)
-	sqmatcher = regexp.MustCompile(`^([\-+]*\d+(?:\.\d+)?):([\-+]*\d+(?:\.\d+)?)[ /-]([\-+]*\d+(?:\.\d+)?):([\-+]*\d+(?:\.\d+)?)$`)
+	pmatcher  = regexp.MustCompile(`^([\-+]*\d+(?:\.\d+)?)[:\|]([\-+]*(?:\d+\.\d+)?)$`)
+	sqmatcher = regexp.MustCompile(`^([\-+]*\d+(?:\.\d+)?)[:\|]([\-+]*\d+(?:\.\d+)?)\s+([\-+]*\d+(?:\.\d+)?)[:\|]([\-+]*\d+(?:\.\d+)?)$`)
+	dmatcher  = regexp.MustCompile(`^\d{4}-\d{2}-\d{2}(?:[Tt]\d{2}:\d{2}(?::\d{2})?)?(?:[zZ]|[+\-]\d{2}:?\d{2})?$`)
+	tmatcher  = regexp.MustCompile(`^([01][0-9]|2[0-3]):([0-5][0-9])$`)
+	wmatcher  = regexp.MustCompile(`^(mon|tue|wed|thu|fri|sat|sun)$`)
+	weekdays  = []string{"sun", "mon", "tue", "wed", "thu", "fri", "sat"}
 	mreplacer = regexp.MustCompile(`\{\{[^\}]*\}\}`)
 )
 
@@ -85,6 +89,7 @@ func parseRecord(rtype, input string, ttl int) (record *RECORD) {
 				record.options = fields[3:]
 			}
 			switch rtype {
+			case "loc": // TODO not implemented yet
 			case "mx":
 				if len(record.options) < 1 {
 					return nil
@@ -107,7 +112,6 @@ func parseRecord(rtype, input string, ttl int) (record *RECORD) {
 					return nil
 				}
 				record.options = record.options[:3]
-			case "loc": // TODO not implemented yet
 
 			}
 		}
@@ -228,10 +232,6 @@ func loadGeobases() {
 }
 
 func reload() {
-	if config != nil {
-		trace = config.GetBoolean("director.trace", false)
-	}
-	loadCaches()
 	loadGeobases()
 	for range time.Tick(5 * time.Second) {
 		if config != nil {
@@ -333,6 +333,62 @@ func nearest(lat1, lon1 float64, selector string) string {
 	return name
 }
 
+func intimes(array []string) bool {
+	now := time.Now()
+	for _, value := range array {
+		for _, predicate := range strings.Split(value, "|") {
+			parts := strings.Split(strings.TrimSpace(predicate), " ")
+			for index, _ := range parts {
+				parts[index] = strings.TrimSpace(parts[index])
+			}
+			if dmatcher.MatchString(parts[0]) {
+				if start, err := time.Parse(time.RFC3339, strings.ToUpper(parts[0])); err != nil {
+					return false
+				} else if now.Sub(start) < 0 {
+					return false
+				} else {
+					if len(parts) >= 2 {
+						if end, err := time.Parse(time.RFC3339, strings.ToUpper(parts[1])); err != nil {
+							return false
+						} else if now.Sub(end) >= 0 {
+							return false
+						}
+					}
+				}
+			} else if wmatcher.MatchString(parts[0]) {
+				day, matched := weekdays[now.Weekday()], false
+				for _, pday := range parts {
+					if day == pday {
+						matched = true
+						break
+					}
+				}
+				if !matched {
+					return false
+				}
+			} else if matches := tmatcher.FindStringSubmatch(parts[0]); matches != nil {
+				hours, _ := strconv.Atoi(matches[1])
+				minutes, _ := strconv.Atoi(matches[2])
+				if (now.UTC().Hour()*60)+now.UTC().Minute() < (hours*60)+minutes {
+					return false
+				}
+				if len(parts) >= 2 {
+					if matches := tmatcher.FindStringSubmatch(parts[1]); matches == nil {
+						return false
+					} else {
+						hours, _ := strconv.Atoi(matches[1])
+						minutes, _ := strconv.Atoi(matches[2])
+						if (now.UTC().Hour()*60)+now.UTC().Minute() >= (hours*60)+minutes {
+							return false
+						}
+					}
+				}
+			}
+		}
+	}
+	return true
+}
+
 func response(qname, rtype string, record *RECORD, rfields map[string]string) {
 	line, name := "", record.name
 	for key, value := range rfields {
@@ -424,12 +480,14 @@ func lookup(qname, qtype, remote string) {
 						rfields["cname"] = geoinfo["country_name"].(string)
 					}
 					if geoinfo["region_code"] != nil {
+						rfields["region"] = strings.ToLower(geoinfo["region_code"].(string))
 						rfields["rcode"] = geoinfo["region_code"].(string)
 					}
 					if geoinfo["region_name"] != nil {
 						rfields["rname"] = geoinfo["region_name"].(string)
 					}
 					if geoinfo["state_code"] != nil {
+						rfields["state"] = strings.ToLower(geoinfo["state_code"].(string))
 						rfields["scode"] = geoinfo["state_code"].(string)
 					}
 					if geoinfo["state_name"] != nil {
@@ -464,7 +522,7 @@ func lookup(qname, qtype, remote string) {
 						}
 						if condition := rule.conditions[ctype]; condition != nil {
 							switch ctype {
-							case "continent", "country", "asnum", "identity":
+							case "continent", "country", "region", "state", "asnum", "identity":
 								if rfields[ctype] == "" {
 									match = false
 								} else if (len(condition.include) > 0 && !instrings(condition.include, rfields[ctype])) ||
@@ -489,7 +547,13 @@ func lookup(qname, qtype, remote string) {
 											match = false
 										}
 									case "distance":
-										if name := nearest(lat, lon, rule.path+"."+condition.selector); name == "" {
+										selector := condition.selector
+										if selector[0] == '/' {
+											selector = selector[1:]
+										} else {
+											selector = rule.path + "." + selector
+										}
+										if name := nearest(lat, lon, selector); name == "" {
 											match = false
 										} else if (len(condition.include) > 0 && !instrings(condition.include, name)) ||
 											(len(condition.exclude) > 0 && instrings(condition.exclude, name)) {
@@ -497,9 +561,13 @@ func lookup(qname, qtype, remote string) {
 										}
 									}
 								}
-							case "time": // TODO not implemented yet
-							case "latency": // TODO not implemented yet
+							case "time":
+								if (len(condition.include) > 0 && !intimes(condition.include)) ||
+									(len(condition.exclude) > 0 && intimes(condition.exclude)) {
+									match = false
+								}
 							case "availability": // TODO not implemented yet
+							case "latency": // TODO not implemented yet
 							}
 						}
 					}
@@ -557,6 +625,10 @@ func lookup(qname, qtype, remote string) {
 
 func backend(configuration string) error {
 	config, _ = uconfig.New(configuration)
+	if config != nil {
+		trace = config.GetBoolean("director.trace", false)
+		loadCaches()
+	}
 	go reload()
 
 	reader := bufio.NewReader(os.Stdin)
@@ -574,7 +646,7 @@ func backend(configuration string) error {
 			} else if len(fields) == 8 && fields[0] == "Q" && fields[2] == "IN" {
 				lookup(strings.ToLower(fields[1]), fields[3], fields[7])
 			} else {
-				fmt.Printf("FAIL invalid request\n")
+				fmt.Printf("FAIL invalid backend request\n")
 			}
 		}
 	}
