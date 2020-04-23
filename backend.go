@@ -3,12 +3,14 @@ package main
 import (
 	"bufio"
 	"crypto/sha1"
+	"encoding/json"
 	"fmt"
 	"hash/crc32"
 	"io/ioutil"
 	"math"
 	"math/rand"
 	"net"
+	"net/http"
 	"os"
 	"regexp"
 	"sort"
@@ -56,6 +58,7 @@ var (
 	config    *uconfig.UConfig
 	trace     bool
 	geobases  = []*prefixdb.PrefixDB{}
+	rchecks   = map[string]map[string]CHECK{}
 	clock     sync.RWMutex
 	watched   = map[string]string{}
 	domains   = map[string]string{}
@@ -259,6 +262,26 @@ func reload() {
 				loadCaches()
 				loadGeobases()
 			}
+
+			if listen := config.GetStringMatch("director.checks.local.listen", "", `^.*?(:\d+)?((,[^,]+){2})?$`); listen != "" {
+				go check(listen)
+			}
+			for _, path := range config.GetPaths("director.checks.remote") {
+				go func(name, remote string) {
+					client := &http.Client{Timeout: 5 * time.Second}
+					if response, err := client.Get(remote); err == nil {
+						if body, err := ioutil.ReadAll(response.Body); err == nil {
+							result := map[string]CHECK{}
+							if json.Unmarshal(body, &result) == nil {
+								clock.Lock()
+								rchecks[name] = result
+								clock.Unlock()
+							}
+						}
+						response.Body.Close()
+					}
+				}(strings.TrimPrefix(path, "director.checks.remote."), config.GetString(path, ""))
+			}
 		}
 	}
 }
@@ -271,7 +294,6 @@ func instrings(array []string, search string) bool {
 	}
 	return false
 }
-
 func innets(array []string, address string) bool {
 	if ip := net.ParseIP(address); ip != nil {
 		for _, value := range array {
@@ -286,7 +308,6 @@ func innets(array []string, address string) bool {
 	}
 	return false
 }
-
 func insquares(array []string, lat, lon float64) bool {
 	for _, value := range array {
 		if matches := sqmatcher.FindStringSubmatch(value); len(matches) >= 5 {
@@ -305,7 +326,6 @@ func insquares(array []string, lat, lon float64) bool {
 	}
 	return false
 }
-
 func distance(lat1, lon1, lat2, lon2 float64) float64 {
 	if (lat1 == 0 && lon1 == 0) || (lat2 == 0 && lon2 == 0) {
 		return -1
@@ -332,7 +352,6 @@ func nearest(lat1, lon1 float64, selector string) string {
 	}
 	return name
 }
-
 func intimes(array []string) bool {
 	now := time.Now()
 	for _, value := range array {
@@ -387,6 +406,45 @@ func intimes(array []string) bool {
 		}
 	}
 	return true
+}
+func passed(array []string) bool {
+	if len(rchecks) == 0 {
+		return true
+	}
+	for _, check := range array {
+		remote := ""
+		if parts := strings.Split(check, "@"); len(parts) > 1 {
+			check, remote = parts[0], parts[1]
+		}
+		if remote != "" {
+			if value, ok := rchecks[remote]; !ok {
+				continue
+			} else {
+				if value, ok := value[check]; !ok {
+					return true
+				} else {
+					if value.State == "up" {
+						return true
+					}
+				}
+			}
+		} else {
+			found := false
+			for _, value := range rchecks {
+				if value, ok := value[check]; ok {
+					found = true
+					if value.State == "up" {
+						return true
+					}
+				}
+			}
+			if !found {
+				return true
+			}
+		}
+
+	}
+	return false
 }
 
 func response(qname, rtype string, record *RECORD, rfields map[string]string) {
@@ -517,9 +575,6 @@ func lookup(qname, qtype, remote string) {
 					match := true
 					affinity = rule.affinity
 					for _, ctype := range ctypes {
-						if !match {
-							break
-						}
 						if condition := rule.conditions[ctype]; condition != nil {
 							switch ctype {
 							case "continent", "country", "region", "state", "asnum", "identity":
@@ -566,9 +621,16 @@ func lookup(qname, qtype, remote string) {
 									(len(condition.exclude) > 0 && intimes(condition.exclude)) {
 									match = false
 								}
-							case "availability": // TODO not implemented yet
+							case "availability":
+								if (len(condition.include) > 0 && !passed(condition.include)) ||
+									(len(condition.exclude) > 0 && passed(condition.exclude)) {
+									match = false
+								}
 							case "latency": // TODO not implemented yet
 							}
+						}
+						if !match {
+							break
 						}
 					}
 					if match {

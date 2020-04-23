@@ -22,7 +22,7 @@ func fetch(remote, target string, retention int) error {
 		lsum = string(content[:40])
 	}
 
-	client := &http.Client{Timeout: 30 * time.Minute}
+	client := &http.Client{Timeout: 30 * time.Second}
 	if response, err := client.Get(remote + ".sum"); err == nil {
 		if content, err := ioutil.ReadAll(response.Body); err != nil {
 			return err
