@@ -35,6 +35,7 @@ var (
 
 func init() {
 	transport = http.DefaultTransport.(*http.Transport).Clone()
+	transport.DisableKeepAlives = true
 	transport.TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
 	transport.DialContext = func(context context.Context, network, address string) (net.Conn, error) {
 		if target := context.Value("address"); target != nil && target != "" {
