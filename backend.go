@@ -84,7 +84,7 @@ func parseRecord(rtype, input string, ttl int) (record *RECORD) {
 				}
 			}
 			if len(fields) > 2 {
-				if weight, err := strconv.Atoi(fields[2]); err == nil && weight != 0 {
+				if weight, err := strconv.Atoi(fields[2]); err == nil {
 					record.weight = int(math.Min(100, math.Max(-1, float64(weight))))
 				}
 			}
@@ -647,7 +647,7 @@ func lookup(qname, qtype, remote string) {
 					if qtype == strings.ToUpper(rtype) || qtype == "ANY" {
 						weights, responded := []int{}, false
 						for position, record := range records[rtype] {
-							if record.weight > 0 {
+							if record.weight >= 0 {
 								for index := 0; index < record.weight; index++ {
 									weights = append(weights, position)
 								}
