@@ -494,7 +494,7 @@ func lookup(qname, qtype, remote string) {
 				}
 				contact = strings.ReplaceAll(contact, "@", ".")
 				server := strings.TrimSpace(config.GetString(domains[domain]+".servers.0", "ns."+domain))
-				line := fmt.Sprintf("DATA\t0\t1\t%s\tIN\tSOA\t%d\t-1\t%s\t%s\t%s\t86400\t7200\t604800\t172800\n", qname, ttl, contact, server, time.Now().UTC().Format("2006010215"))
+				line := fmt.Sprintf("DATA\t0\t1\t%s\tIN\tSOA\t%d\t-1\t%s\t%s\t%s\t86400\t7200\t604800\t172800\n", qname, ttl, server, contact, time.Now().UTC().Format("2006010215"))
 				fmt.Printf("%s", line)
 				if trace {
 					fmt.Fprintf(os.Stderr, "  %s", line)
