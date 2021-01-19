@@ -2,10 +2,10 @@ Source: nsdirector
 Section: net
 Priority: optional
 Maintainer: Pierre-Yves Kerembellec <py.kerembellec@gmail.com>
-Build-Depends: debhelper (>= 5), golang-1.14
+Build-Depends: debhelper (>= 5), golang-1.15
 Standards-Version: 3.7.2
 
 Package: nsdirector
 Architecture: any
-Description: PowerDNS advanced GeoDNS backend
+Description: PowerDNS advanced geodns backend
 

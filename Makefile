@@ -2,7 +2,9 @@
 
 # build targets
 nsdirector: *.go
-	@export GOPATH=/tmp/go; export CGO_ENABLED=0; go build -trimpath -o nsdirector && strip nsdirector
+	@env GOPATH=/tmp/go CGO_ENABLED=0 go build -trimpath -o nsdirector
+	@-strip nsdirector 2>/dev/null || true
+	@-upx -9 nsdirector 2>/dev/null || true
 clean:
 	@rm -rf local remote
 	@cd support && make clean && cd ..

@@ -23,7 +23,7 @@ type CHECK struct {
 	Last      int    `json:"last"`
 	State     string `json:"state"`
 	Latency   int    `json:"latency"`
-	Try       int    `json:"try"`
+	Retries   int    `json:"retries"`
 	latencies []int
 }
 
@@ -80,8 +80,7 @@ func do(name, method, url, payload string, headers map[string]string, cstatus, c
 			request.Header.Add(name, value)
 		}
 		client := &http.Client{Transport: transport, Timeout: timeout}
-		response, err := client.Do(request)
-		if err == nil {
+		if response, err := client.Do(request); err == nil {
 			pass = true
 			if cstatus != "" {
 				if matcher := rcache.Get(cstatus); matcher != nil && !matcher.MatchString(fmt.Sprintf("%d", response.StatusCode)) {
@@ -114,6 +113,8 @@ func do(name, method, url, payload string, headers map[string]string, cstatus, c
 				}
 			}
 			response.Body.Close()
+		} else {
+			pass, reason = false, fmt.Sprintf("%v", err)
 		}
 	}
 
@@ -137,27 +138,27 @@ func do(name, method, url, payload string, headers map[string]string, cstatus, c
 	checks[name].Latency = latency / divider
 	if checks[name].State == "up" {
 		if pass {
-			checks[name].Try = 0
+			checks[name].Retries = 0
 		} else {
-			checks[name].Try++
-			fmt.Fprintf(os.Stderr, "[%d] %s is falling (try %d / %s)\n", os.Getpid(), name, checks[name].Try, reason)
-			if checks[name].Try >= retries {
+			checks[name].Retries++
+			fmt.Fprintf(os.Stderr, "[%d] %s is falling (retries %d/%d - %s)\n", os.Getpid(), name, checks[name].Retries, retries, reason)
+			if checks[name].Retries >= retries {
 				checks[name].State = "down"
-				checks[name].Try = 0
+				checks[name].Retries = 0
 				fmt.Fprintf(os.Stderr, "[%d] %s is down\n", os.Getpid(), name)
 			}
 		}
 	} else {
 		if pass {
-			checks[name].Try++
-			fmt.Fprintf(os.Stderr, "[%d] %s is rising (try %d)\n", os.Getpid(), name, checks[name].Try)
-			if checks[name].Try >= retries {
+			checks[name].Retries++
+			fmt.Fprintf(os.Stderr, "[%d] %s is rising (retries %d/%d)\n", os.Getpid(), name, checks[name].Retries, retries)
+			if checks[name].Retries >= retries {
 				checks[name].State = "up"
-				checks[name].Try = 0
+				checks[name].Retries = 0
 				fmt.Fprintf(os.Stderr, "[%d] %s is up\n", os.Getpid(), name)
 			}
 		} else {
-			checks[name].Try = 0
+			checks[name].Retries = 0
 		}
 	}
 	if metrics {
@@ -172,22 +173,29 @@ func check(listen string) {
 
 	go func() {
 		lock.Lock()
-		if len(checks) != 0 {
-			lock.Unlock()
-			return
-		}
 		for _, path1 := range config.GetPaths("domains") {
 			for _, path2 := range config.GetPaths(path1 + ".checks") {
 				name := strings.TrimPrefix(path2, path1+".checks.")
-				checks[name] = &CHECK{0, "up", 0, 0, []int{}}
+				if _, ok := checks[name]; !ok {
+					checks[name] = &CHECK{0, "up", 0, 0, []int{}}
+				}
+			}
+		}
+		if len(checks) == 0 {
+			lock.Unlock()
+			return
+		}
+		for name, check := range checks {
+			if check.Last != 0 && int(time.Now().Unix())-check.Last >= 30 {
+				delete(checks, name)
 			}
 		}
 		lock.Unlock()
 
-		timer := time.NewTicker(uconfig.Duration(config.GetDurationBounds("director.checks.frequency", 10, 2, 60)))
+		ticker := time.NewTicker(uconfig.Duration(config.GetDurationBounds("director.checks.frequency", 10, 2, 60)))
 		for {
 			select {
-			case <-timer.C:
+			case <-ticker.C:
 				for _, path1 := range config.GetPaths("domains") {
 					for _, path2 := range config.GetPaths(path1 + ".checks") {
 						if url := strings.TrimSpace(config.GetString(path2+".target.url", "")); url != "" {
@@ -215,6 +223,7 @@ func check(listen string) {
 				return
 			}
 		}
+		ticker.Stop()
 	}()
 
 	handler := http.NewServeMux()
@@ -243,6 +252,6 @@ func check(listen string) {
 		}
 	}
 
-	exit <- true
+	close(exit)
 	time.Sleep(time.Second)
 }

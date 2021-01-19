@@ -254,6 +254,8 @@ func reload() {
 							watched[path] = sum
 						}
 					}
+				} else {
+					watched[path] = ""
 				}
 			}
 			if changes {

@@ -57,6 +57,16 @@ func pack(root, target string, retention int) error {
 			}
 		}
 
+		if sum1, err := ioutil.ReadFile(target + ".sum_"); err == nil {
+			if sum2, err := ioutil.ReadFile(target + ".sum"); err == nil {
+				if string(sum1) == string(sum2) {
+					os.Remove(target + ".pack_")
+					os.Remove(target + ".sum_")
+					return nil
+				}
+			}
+		}
+
 		if content, err := ioutil.ReadFile(target + ".pack"); err == nil {
 			ioutil.WriteFile(fmt.Sprintf("%s.pack.%d", target, time.Now().Unix()), content, 0644)
 		}
