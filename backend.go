@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"os"
 	"regexp"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -65,7 +66,7 @@ var (
 	entries   = map[string][]RULE{}
 	ctypes    = []string{"continent", "country", "region", "state", "asnum", "cidr", "square", "distance", "identity", "time", "availability", "latency"}
 	rtypes    = []string{"cname", "a", "aaaa", "loc", "mx", "ptr", "srv", "txt"}
-	pmatcher  = regexp.MustCompile(`^([\-+]*\d+(?:\.\d+)?)[:\|]([\-+]*(?:\d+\.\d+)?)$`)
+	pmatcher  = regexp.MustCompile(`^([\-+]*\d+(?:\.\d+)?)[:\|]([\-+]*(?:\d+\.\d+)?)(?:[:\|]([\-+]*\d{1,2}))?$`)
 	sqmatcher = regexp.MustCompile(`^([\-+]*\d+(?:\.\d+)?)[:\|]([\-+]*\d+(?:\.\d+)?)\s+([\-+]*\d+(?:\.\d+)?)[:\|]([\-+]*\d+(?:\.\d+)?)$`)
 	dmatcher  = regexp.MustCompile(`^\d{4}-\d{2}-\d{2}(?:[Tt]\d{2}:\d{2}(?::\d{2})?)?(?:[zZ]|[+\-]\d{2}:?\d{2})?$`)
 	tmatcher  = regexp.MustCompile(`^([01][0-9]|2[0-3]):([0-5][0-9])$`)
@@ -231,6 +232,7 @@ func loadGeobases() {
 		clock.Lock()
 		geobases = bases
 		clock.Unlock()
+		runtime.GC()
 	}
 }
 
@@ -344,10 +346,18 @@ func distance(lat1, lon1, lat2, lon2 float64) float64 {
 func nearest(lat1, lon1 float64, selector string) string {
 	max, name := 100000.0, ""
 	for _, path := range config.GetPaths(selector) {
-		if matches := pmatcher.FindStringSubmatch(config.GetString(path, "")); len(matches) >= 3 {
+		if matches := pmatcher.FindStringSubmatch(config.GetString(path, "")); len(matches) >= 4 {
 			lat2, _ := strconv.ParseFloat(matches[1], 64)
 			lon2, _ := strconv.ParseFloat(matches[2], 64)
-			if value := distance(lat1, lon1, lat2, lon2); value < max {
+			value := distance(lat1, lon1, lat2, lon2)
+			if bias, err := strconv.ParseFloat(matches[3], 64); err == nil {
+				if bias > 0 {
+					value = value * (1 - (bias / 100))
+				} else {
+					value = value / (1 + (bias / 100))
+				}
+			}
+			if value < max {
 				max, name = value, strings.TrimPrefix(path, selector+".")
 			}
 		}
@@ -592,7 +602,7 @@ func lookup(qname, qtype, remote string) {
 									match = false
 								}
 							case "square", "distance":
-								if matches := pmatcher.FindStringSubmatch(rfields["latitude"] + ":" + rfields["longitude"]); len(matches) < 3 {
+								if matches := pmatcher.FindStringSubmatch(rfields["latitude"] + ":" + rfields["longitude"]); len(matches) < 4 {
 									match = false
 								} else {
 									lat, _ := strconv.ParseFloat(matches[1], 64)

@@ -1,3 +1,9 @@
+nsdirector (1.4.1) stable; urgency=medium
+
+  * keep memory usage to a minimum when reloading geobases
+
+ -- Pierre-Yves Kerembellec <py.kerembellec@gmail.com>  Fri, 15 Jan 2021 09:20:16 +0100
+
 nsdirector (1.4.0) stable; urgency=medium
 
   * minor fixes and optimizations release
