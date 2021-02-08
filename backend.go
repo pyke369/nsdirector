@@ -23,6 +23,7 @@ import (
 	"github.com/pyke369/golang-support/fqdn"
 	"github.com/pyke369/golang-support/prefixdb"
 	"github.com/pyke369/golang-support/uconfig"
+	"github.com/pyke369/golang-support/ulog"
 )
 
 type CONDITION struct {
@@ -57,6 +58,7 @@ func (a BYPRIORITY) Less(i, j int) bool {
 
 var (
 	config    *uconfig.UConfig
+	logger    *ulog.ULog
 	trace     bool
 	geobases  = []*prefixdb.PrefixDB{}
 	rchecks   = map[string]map[string]CHECK{}
@@ -261,8 +263,9 @@ func reload() {
 				}
 			}
 			if changes {
-				fmt.Fprintf(os.Stderr, "[%d] reloading configuration\n", os.Getpid())
 				config.Reload()
+				logger.Load(config.GetString("director.log", "console()"))
+				logger.Info(map[string]interface{}{"event": "reload", "pid": os.Getpid(), "version": version})
 				loadCaches()
 				loadGeobases()
 			}
@@ -699,12 +702,15 @@ func lookup(qname, qtype, remote string) {
 
 func backend(configuration string) error {
 	config, _ = uconfig.New(configuration)
+	logger = ulog.New("console()")
 	if config != nil {
 		trace = config.GetBoolean("director.trace", false)
+		logger.Load(config.GetString("director.log", "console()"))
 		loadCaches()
 	}
 	go reload()
 
+	logger.Info(map[string]interface{}{"event": "start", "pid": os.Getpid(), "version": version, "configuration": configuration})
 	reader := bufio.NewReader(os.Stdin)
 	for {
 		if line, err := reader.ReadString('\n'); err != nil {
@@ -724,5 +730,6 @@ func backend(configuration string) error {
 			}
 		}
 	}
+	logger.Info(map[string]interface{}{"event": "stop", "pid": os.Getpid(), "version": version, "configuration": configuration})
 	return nil
 }

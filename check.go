@@ -141,21 +141,23 @@ func do(name, method, url, payload string, headers map[string]string, cstatus, c
 			checks[name].Retries = 0
 		} else {
 			checks[name].Retries++
-			fmt.Fprintf(os.Stderr, "[%d] %s is falling (retries %d/%d - %s)\n", os.Getpid(), name, checks[name].Retries, retries, reason)
+			logger.Info(map[string]interface{}{"event": "fall", "pid": os.Getpid(), "check": name,
+				"reason": reason, "retries": fmt.Sprintf("%d/%d", checks[name].Retries, retries)})
 			if checks[name].Retries >= retries {
 				checks[name].State = "down"
 				checks[name].Retries = 0
-				fmt.Fprintf(os.Stderr, "[%d] %s is down\n", os.Getpid(), name)
+				logger.Info(map[string]interface{}{"event": "down", "pid": os.Getpid(), "check": name})
 			}
 		}
 	} else {
 		if pass {
 			checks[name].Retries++
-			fmt.Fprintf(os.Stderr, "[%d] %s is rising (retries %d/%d)\n", os.Getpid(), name, checks[name].Retries, retries)
+			logger.Info(map[string]interface{}{"event": "rise", "pid": os.Getpid(), "check": name,
+				"retries": fmt.Sprintf("%d/%d", checks[name].Retries, retries)})
 			if checks[name].Retries >= retries {
 				checks[name].State = "up"
 				checks[name].Retries = 0
-				fmt.Fprintf(os.Stderr, "[%d] %s is up\n", os.Getpid(), name)
+				logger.Info(map[string]interface{}{"event": "up", "pid": os.Getpid(), "check": name})
 			}
 		} else {
 			checks[name].Retries = 0
@@ -178,16 +180,14 @@ func check(listen string) {
 				name := strings.TrimPrefix(path2, path1+".checks.")
 				if _, ok := checks[name]; !ok {
 					checks[name] = &CHECK{0, "up", 0, 0, []int{}}
+					logger.Info(map[string]interface{}{"event": "add", "pid": os.Getpid(), "check": name})
 				}
 			}
-		}
-		if len(checks) == 0 {
-			lock.Unlock()
-			return
 		}
 		for name, check := range checks {
 			if check.Last != 0 && int(time.Now().Unix())-check.Last >= 30 {
 				delete(checks, name)
+				logger.Info(map[string]interface{}{"event": "remove", "pid": os.Getpid(), "check": name})
 			}
 		}
 		lock.Unlock()

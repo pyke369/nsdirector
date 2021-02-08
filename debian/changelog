@@ -1,3 +1,9 @@
+nsdirector (1.4.2) stable; urgency=medium
+
+  * log checks activity through proper logger
+
+ -- Pierre-Yves Kerembellec <py.kerembellec@gmail.com>  Mon, 08 Feb 2021 15:49:37 +0100
+
 nsdirector (1.4.1) stable; urgency=medium
 
   * keep memory usage to a minimum when reloading geobases
