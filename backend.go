@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"github.com/pyke369/golang-support/fqdn"
+	"github.com/pyke369/golang-support/jsonrpc"
 	"github.com/pyke369/golang-support/prefixdb"
 	"github.com/pyke369/golang-support/uconfig"
 	"github.com/pyke369/golang-support/ulog"
@@ -59,7 +60,6 @@ func (a BYPRIORITY) Less(i, j int) bool {
 var (
 	config    *uconfig.UConfig
 	logger    *ulog.ULog
-	trace     bool
 	geobases  = []*prefixdb.PrefixDB{}
 	rchecks   = map[string]map[string]CHECK{}
 	clock     sync.RWMutex
@@ -242,7 +242,6 @@ func reload() {
 	loadGeobases()
 	for range time.Tick(5 * time.Second) {
 		if config != nil {
-			trace = config.GetBoolean("director.trace", false)
 			changes := false
 			for _, path := range config.GetPaths("director.watch") {
 				path = strings.TrimSpace(config.GetString(path, ""))
@@ -322,9 +321,9 @@ func insquares(array []string, lat, lon float64) bool {
 			lon1, _ := strconv.ParseFloat(matches[2], 64)
 			lat2, _ := strconv.ParseFloat(matches[3], 64)
 			lon2, _ := strconv.ParseFloat(matches[4], 64)
-			if lat >= -180 && lat <= 180 && lon >= -180 && lon <= 180 &&
-				lat1 >= -180 && lat1 <= 180 && lon1 >= -180 && lon1 <= 180 &&
-				lat2 >= -180 && lat2 <= 180 && lon2 >= -180 && lon2 <= 180 &&
+			if lat >= -90 && lat <= 90 && lon >= -180 && lon <= 180 &&
+				lat1 >= -90 && lat1 <= 90 && lon1 >= -180 && lon1 <= 180 &&
+				lat2 >= -90 && lat2 <= 90 && lon2 >= -180 && lon2 <= 180 &&
 				lat1 > lat2 && lon1 < lon2 &&
 				lat1 >= lat && lat >= lat2 && lon1 <= lon && lon <= lon2 {
 				return true
@@ -462,7 +461,7 @@ func passed(array []string) bool {
 	return false
 }
 
-func response(qname, rtype string, record *RECORD, rfields map[string]string) {
+func response(qname, rtype string, record *RECORD, rfields map[string]string) string {
 	line, name := "", record.name
 	for key, value := range rfields {
 		if key == "cncode" || key == "ccode" || key == "asnum" {
@@ -473,29 +472,22 @@ func response(qname, rtype string, record *RECORD, rfields map[string]string) {
 	name = mreplacer.ReplaceAllString(name, "")
 	switch rtype {
 	case "a", "aaaa", "cname", "ptr":
-		line = fmt.Sprintf("DATA\t%s\t1\t%s\tIN\t%s\t%d\t-1\t%s\n", rfields["bits"], qname, strings.ToUpper(rtype), record.ttl, name)
+		line = fmt.Sprintf("%s\t1\t%s\tIN\t%s\t%d\t-1\t%s", rfields["bits"], qname, strings.ToUpper(rtype), record.ttl, name)
 	case "loc": // TODO not implemented yet
 	case "mx":
-		line = fmt.Sprintf("DATA\t%s\t1\t%s\tIN\tMX\t%d\t-1\t%s\t%s\n", rfields["bits"], qname, record.ttl, record.options[0], name)
+		line = fmt.Sprintf("%s\t1\t%s\tIN\tMX\t%d\t-1\t%s\t%s", rfields["bits"], qname, record.ttl, record.options[0], name)
 	case "srv":
-		line = fmt.Sprintf("DATA\t%s\t1\t%s\tIN\tSRV\t%d\t-1\t%s\t%s %s %s\n", rfields["bits"], qname, record.ttl, record.options[0], record.options[1], record.options[2], name)
+		line = fmt.Sprintf("%s\t1\t%s\tIN\tSRV\t%d\t-1\t%s\t%s %s %s", rfields["bits"], qname, record.ttl, record.options[0], record.options[1], record.options[2], name)
 	case "txt":
-		line = fmt.Sprintf("DATA\t%s\t1\t%s\tIN\tTXT\t%d\t-1\t\"%s\"\n", rfields["bits"], qname, record.ttl, strings.ReplaceAll(name, `"`, `\"`))
+		line = fmt.Sprintf("%s\t1\t%s\tIN\tTXT\t%d\t-1\t\"%s\"", rfields["bits"], qname, record.ttl, strings.ReplaceAll(name, `"`, `\"`))
 	}
-	if line != "" {
-		fmt.Printf("%s", line)
-		if trace {
-			fmt.Fprintf(os.Stderr, "  %s", line)
-		}
-	}
+	return line
 }
 
-func lookup(qname, qtype, remote string) {
+func lookup(qname, qtype, remote string) (result []string) {
 	clock.RLock()
+	result = []string{}
 	if config != nil {
-		if trace {
-			fmt.Fprintf(os.Stderr, "- %s %s %s\n", qname, qtype, remote)
-		}
 		if domains[qname] != "" || len(entries[qname]) > 0 {
 			domain := qname
 			if len(entries[qname]) > 0 {
@@ -509,20 +501,13 @@ func lookup(qname, qtype, remote string) {
 				}
 				contact = strings.ReplaceAll(contact, "@", ".")
 				server := strings.TrimSpace(config.GetString(domains[domain]+".servers.0", "ns."+domain))
-				line := fmt.Sprintf("DATA\t0\t1\t%s\tIN\tSOA\t%d\t-1\t%s\t%s\t%s\t86400\t7200\t604800\t172800\n", qname, ttl, server, contact, time.Now().UTC().Format("2006010215"))
-				fmt.Printf("%s", line)
-				if trace {
-					fmt.Fprintf(os.Stderr, "  %s", line)
-				}
+				result = append(result, fmt.Sprintf("0\t1\t%s\tIN\tSOA\t%d\t-1\t%s\t%s\t%s\t86400\t7200\t604800\t172800",
+					qname, ttl, server, contact, time.Now().UTC().Format("2006010215")))
 			}
 			if qtype == "NS" || qtype == "ANY" {
 				for _, path := range config.GetPaths(domains[domain] + ".servers") {
 					if server := strings.TrimSpace(config.GetString(path, "")); server != "" {
-						line := fmt.Sprintf("DATA\t0\t1\t%s\tIN\tNS\t%d\t-1\t%s\n", qname, ttl, server)
-						fmt.Printf("%s", line)
-						if trace {
-							fmt.Fprintf(os.Stderr, "  %s", line)
-						}
+						result = append(result, fmt.Sprintf("0\t1\t%s\tIN\tNS\t%d\t-1\t%s", qname, ttl, server))
 					}
 				}
 			}
@@ -667,7 +652,7 @@ func lookup(qname, qtype, remote string) {
 									weights = append(weights, position)
 								}
 							} else {
-								response(qname, rtype, record, rfields)
+								result = append(result, response(qname, rtype, record, rfields))
 								responded = true
 								if rtype == "cname" {
 									break
@@ -681,7 +666,7 @@ func lookup(qname, qtype, remote string) {
 							} else {
 								position = rand.Int() % len(weights)
 							}
-							response(qname, rtype, records[rtype][weights[position]], rfields)
+							result = append(result, response(qname, rtype, records[rtype][weights[position]], rfields))
 							responded = true
 						}
 						if responded && rtype == "cname" {
@@ -692,44 +677,108 @@ func lookup(qname, qtype, remote string) {
 			}
 		}
 	}
-
-	fmt.Printf("END\n")
-	if trace {
-		fmt.Fprintf(os.Stderr, "  END\n\n")
-	}
 	clock.RUnlock()
+	return
 }
 
 func backend(configuration string) error {
 	config, _ = uconfig.New(configuration)
 	logger = ulog.New("console()")
 	if config != nil {
-		trace = config.GetBoolean("director.trace", false)
 		logger.Load(config.GetString("director.log", "console()"))
 		loadCaches()
 	}
 	go reload()
-
 	logger.Info(map[string]interface{}{"event": "start", "pid": os.Getpid(), "version": version, "configuration": configuration})
-	reader := bufio.NewReader(os.Stdin)
-	for {
-		if line, err := reader.ReadString('\n'); err != nil {
-			break
-		} else {
-			fields := strings.Split(strings.TrimSpace(line), "\t")
-			if len(fields) == 2 && fields[0] == "HELO" {
-				if fields[1] != "3" {
-					fmt.Printf("FAIL invalid ABI version %s\n", fields[1])
-				} else {
-					fmt.Printf("OK [%d] %s/%s ready\n", os.Getpid(), progname, version)
+
+	if listen := config.GetString("director.listen", "_"); listen != "_" {
+		// remote backend
+		handler := http.NewServeMux()
+		handler.HandleFunc("/", func(response http.ResponseWriter, request *http.Request) {
+			response.Header().Set("Content-Type", "application/json")
+			result := map[string]interface{}{"result": false}
+			if body, err := ioutil.ReadAll(request.Body); err == nil {
+				payload := map[string]interface{}{}
+				if json.Unmarshal(body, &payload) == nil {
+					switch jsonrpc.String(payload["method"]) {
+					case "initialize":
+						result["result"] = true
+					case "lookup":
+						qname, qtype, remote := "", "", ""
+						for name, value := range jsonrpc.StringMap(payload["parameters"]) {
+							switch name {
+							case "qname":
+								qname = strings.ToLower(strings.TrimRight(value, "."))
+							case "qtype":
+								qtype = value
+							case "real-remote":
+								remote = value
+							}
+						}
+						records := []map[string]interface{}{}
+						for _, line := range lookup(qname, qtype, remote) {
+							if fields := strings.Split(line, "\t"); len(fields) >= 7 {
+								scope, _ := strconv.Atoi(fields[0])
+								ttl, _ := strconv.Atoi(fields[5])
+								records = append(records, map[string]interface{}{
+									"scopeMask": scope,
+									"qname":     fields[2],
+									"qtype":     fields[4],
+									"ttl":       ttl,
+									"content":   strings.Join(fields[7:], "\t"),
+								})
+							}
+						}
+						result["result"] = records
+					}
 				}
-			} else if len(fields) == 8 && fields[0] == "Q" && fields[2] == "IN" {
-				lookup(strings.ToLower(fields[1]), fields[3], fields[7])
+			}
+			if payload, err := json.Marshal(result); err == nil {
+				response.Write(payload)
+			}
+		})
+		server := &http.Server{
+			Handler:           handler,
+			Addr:              strings.TrimLeft(listen, "*"),
+			IdleTimeout:       60 * time.Second,
+			ReadHeaderTimeout: 7 * time.Second,
+			ReadTimeout:       7 * time.Second,
+			WriteTimeout:      10 * time.Second,
+		}
+		logger.Info(map[string]interface{}{"event": "listen", "listen": listen})
+		for {
+			server.ListenAndServe()
+			time.Sleep(time.Second)
+		}
+
+	} else {
+		// pipe backend
+		reader := bufio.NewReader(os.Stdin)
+		for {
+			if line, err := reader.ReadString('\n'); err != nil {
+				break
 			} else {
-				fmt.Printf("FAIL invalid backend request\n")
+				fields := strings.Split(strings.TrimSpace(line), "\t")
+				if len(fields) == 2 && fields[0] == "HELO" {
+					if fields[1] != "3" {
+						fmt.Printf("FAIL invalid ABI version %s\n", fields[1])
+					} else {
+						fmt.Printf("OK [%d] %s/%s ready\n", os.Getpid(), progname, version)
+					}
+				} else if len(fields) == 8 && fields[0] == "Q" && fields[2] == "IN" {
+					for _, line := range lookup(strings.ToLower(fields[1]), fields[3], fields[7]) {
+						if line != "" {
+							fmt.Printf("DATA\t%s\n", line)
+						}
+					}
+					fmt.Printf("END\n")
+				} else {
+					fmt.Printf("FAIL invalid backend request\n")
+				}
 			}
 		}
 	}
+
 	logger.Info(map[string]interface{}{"event": "stop", "pid": os.Getpid(), "version": version, "configuration": configuration})
 	return nil
 }
