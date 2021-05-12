@@ -9,7 +9,7 @@ clean:
 	@rm -rf local remote
 	@cd support && make clean && cd ..
 distclean: clean
-	@rm -f nsdirector
+	@rm -f nsdirector *.upx
 	@cd support && make distclean && cd ..
 deb:
 	@debuild -e GOROOT -e PATH -i -us -uc -b
