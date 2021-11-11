@@ -17,7 +17,6 @@ import (
 	"sort"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/pyke369/golang-support/fqdn"
@@ -62,7 +61,6 @@ var (
 	logger    *ulog.ULog
 	geobases  = []*prefixdb.PrefixDB{}
 	rchecks   = map[string]map[string]CHECK{}
-	clock     sync.RWMutex
 	watched   = map[string]string{}
 	domains   = map[string]string{}
 	entries   = map[string][]RULE{}
@@ -215,25 +213,21 @@ func loadCaches() {
 				}
 			}
 		}
-		clock.Lock()
 		domains = ndomains
 		entries = nentries
-		clock.Unlock()
 	}
 }
 
 func loadGeobases() {
 	if config != nil {
 		bases := []*prefixdb.PrefixDB{}
-		for _, path := range config.GetPaths("director.geobases") {
+		for _, path := range config.GetPaths(progname + ".geobases") {
 			base := prefixdb.New()
 			if err := base.Load(config.GetString(path, "")); err == nil {
 				bases = append(bases, base)
 			}
 		}
-		clock.Lock()
 		geobases = bases
-		clock.Unlock()
 		runtime.GC()
 	}
 }
@@ -243,7 +237,7 @@ func reload() {
 	for range time.Tick(5 * time.Second) {
 		if config != nil {
 			changes := false
-			for _, path := range config.GetPaths("director.watch") {
+			for _, path := range config.GetPaths(progname + ".watch") {
 				path = strings.TrimSpace(config.GetString(path, ""))
 				if info, err := os.Stat(path); err == nil {
 					if time.Now().Sub(info.ModTime()) >= 5*time.Second {
@@ -263,31 +257,28 @@ func reload() {
 			}
 			if changes {
 				config.Reload()
-				logger.Load(config.GetString("director.log", "console()"))
+				logger.Load(config.GetString(progname+".log", "console()"))
 				logger.Info(map[string]interface{}{"event": "reload", "pid": os.Getpid(), "version": version})
 				loadCaches()
 				loadGeobases()
 			}
 
-			if listen := config.GetStringMatch("director.checks.local.listen", "", `^.*?(:\d+)?((,[^,]+){2})?$`); listen != "" {
+			if listen := config.GetStringMatch(progname+".checks.local.listen", "", `^.*?(:\d+)?((,[^,]+){2})?$`); listen != "" {
 				go check(listen)
 			}
-			for _, path := range config.GetPaths("director.checks.remote") {
-				go func(name, remote string) {
-					client := &http.Client{Timeout: 5 * time.Second}
-					if response, err := client.Get(remote); err == nil {
-						if body, err := ioutil.ReadAll(response.Body); err == nil {
-							result := map[string]CHECK{}
-							if json.Unmarshal(body, &result) == nil {
-								clock.Lock()
-								rchecks[name] = result
-								clock.Unlock()
-							}
+			client, nrchecks := &http.Client{Timeout: 5 * time.Second}, map[string]map[string]CHECK{}
+			for _, path := range config.GetPaths(progname + ".checks.remote") {
+				if response, err := client.Get(config.GetString(path, "")); err == nil {
+					if body, err := ioutil.ReadAll(response.Body); err == nil {
+						result := map[string]CHECK{}
+						if json.Unmarshal(body, &result) == nil {
+							nrchecks[strings.TrimPrefix(path, progname+".checks.remote.")] = result
 						}
-						response.Body.Close()
 					}
-				}(strings.TrimPrefix(path, "director.checks.remote."), config.GetString(path, ""))
+					response.Body.Close()
+				}
 			}
+			rchecks = nrchecks
 		}
 	}
 }
@@ -485,12 +476,12 @@ func response(qname, rtype string, record *RECORD, rfields map[string]string) st
 }
 
 func lookup(qname, qtype, remote string) (result []string) {
-	clock.RLock()
 	result = []string{}
 	if config != nil {
-		if domains[qname] != "" || len(entries[qname]) > 0 {
+		length := len(entries[qname])
+		if domains[qname] != "" || length > 0 {
 			domain := qname
-			if len(entries[qname]) > 0 {
+			if length > 0 {
 				domain = strings.SplitN(qname, ".", 2)[1]
 			}
 			ttl := config.GetIntegerBounds(domains[domain]+".ttl", 600, 10, 86400)
@@ -512,8 +503,8 @@ func lookup(qname, qtype, remote string) (result []string) {
 				}
 			}
 
-			if len(entries[qname]) > 0 && qtype != "SOA" && qtype != "NS" {
-				rfields := map[string]string{"remote": "0.0.0.0", "bits": "32", "identity": config.GetString("director.identity", "")}
+			if length > 0 && qtype != "SOA" && qtype != "NS" {
+				rfields := map[string]string{"remote": "0.0.0.0", "bits": "32", "identity": config.GetString(progname+".identity", "")}
 				rfields["hostname"], _ = fqdn.FQDN()
 				if address, network, err := net.ParseCIDR(remote); err == nil {
 					bits, _ := network.Mask.Size()
@@ -677,7 +668,6 @@ func lookup(qname, qtype, remote string) (result []string) {
 			}
 		}
 	}
-	clock.RUnlock()
 	return
 }
 
@@ -685,70 +675,140 @@ func backend(configuration string) error {
 	config, _ = uconfig.New(configuration)
 	logger = ulog.New("console()")
 	if config != nil {
-		logger.Load(config.GetString("director.log", "console()"))
+		logger.Load(config.GetString(progname+".log", "console()"))
 		loadCaches()
 	}
 	go reload()
-	logger.Info(map[string]interface{}{"event": "start", "pid": os.Getpid(), "version": version, "configuration": configuration})
+	logger.Info(map[string]interface{}{"event": "start", "version": version, "configuration": configuration, "pid": os.Getpid()})
 
-	if listen := config.GetString("director.listen", "_"); listen != "_" {
-		// remote backend
-		handler := http.NewServeMux()
-		handler.HandleFunc("/", func(response http.ResponseWriter, request *http.Request) {
-			response.Header().Set("Content-Type", "application/json")
-			result := map[string]interface{}{"result": false}
-			if body, err := ioutil.ReadAll(request.Body); err == nil {
-				payload := map[string]interface{}{}
-				if json.Unmarshal(body, &payload) == nil {
-					switch jsonrpc.String(payload["method"]) {
-					case "initialize":
-						result["result"] = true
-					case "lookup":
-						qname, qtype, remote := "", "", ""
-						for name, value := range jsonrpc.StringMap(payload["parameters"]) {
-							switch name {
-							case "qname":
-								qname = strings.ToLower(strings.TrimRight(value, "."))
-							case "qtype":
-								qtype = value
-							case "real-remote":
-								remote = value
+	if listen := config.GetString(progname+".listen", "_"); listen != "_" {
+
+		if _, _, err := net.SplitHostPort(listen); err == nil {
+			// remote HTTP backend
+			handler := http.NewServeMux()
+			handler.HandleFunc("/", func(response http.ResponseWriter, request *http.Request) {
+				response.Header().Set("Content-Type", "application/json")
+				result := map[string]interface{}{"result": false}
+				if body, err := ioutil.ReadAll(request.Body); err == nil {
+					payload := map[string]interface{}{}
+					if json.Unmarshal(body, &payload) == nil {
+						switch jsonrpc.String(payload["method"]) {
+						case "initialize":
+							result["result"] = true
+						case "lookup":
+							MetricsCount("request", 1, map[string]interface{}{"mode": "http"})
+							qname, qtype, remote := "", "", ""
+							for name, value := range jsonrpc.StringMap(payload["parameters"]) {
+								switch name {
+								case "qname":
+									qname = strings.ToLower(strings.TrimRight(value, "."))
+								case "qtype":
+									qtype = value
+								case "real-remote":
+									remote = value
+								}
 							}
-						}
-						records := []map[string]interface{}{}
-						for _, line := range lookup(qname, qtype, remote) {
-							if fields := strings.Split(line, "\t"); len(fields) >= 7 {
-								scope, _ := strconv.Atoi(fields[0])
-								ttl, _ := strconv.Atoi(fields[5])
-								records = append(records, map[string]interface{}{
-									"scopeMask": scope,
-									"qname":     fields[2],
-									"qtype":     fields[4],
-									"ttl":       ttl,
-									"content":   strings.Join(fields[7:], "\t"),
-								})
+							records := []map[string]interface{}{}
+							for _, line := range lookup(qname, qtype, remote) {
+								if fields := strings.Split(line, "\t"); len(fields) >= 7 {
+									scope, _ := strconv.Atoi(fields[0])
+									ttl, _ := strconv.Atoi(fields[5])
+									records = append(records, map[string]interface{}{
+										"scopeMask": scope,
+										"qname":     fields[2],
+										"qtype":     fields[4],
+										"ttl":       ttl,
+										"content":   strings.Join(fields[7:], "\t"),
+									})
+								}
 							}
+							result["result"] = records
 						}
-						result["result"] = records
 					}
 				}
+				if payload, err := json.Marshal(result); err == nil {
+					response.Write(payload)
+					MetricsCount("response", 1, map[string]interface{}{"mode": "http"})
+				}
+			})
+			server := &http.Server{
+				Handler:           handler,
+				Addr:              strings.TrimLeft(listen, "*"),
+				IdleTimeout:       60 * time.Second,
+				ReadHeaderTimeout: 7 * time.Second,
+				ReadTimeout:       7 * time.Second,
+				WriteTimeout:      10 * time.Second,
 			}
-			if payload, err := json.Marshal(result); err == nil {
-				response.Write(payload)
+			logger.Info(map[string]interface{}{"event": "listen", "listen": listen, "mode": "http"})
+			for {
+				server.ListenAndServe()
+				time.Sleep(time.Second)
 			}
-		})
-		server := &http.Server{
-			Handler:           handler,
-			Addr:              strings.TrimLeft(listen, "*"),
-			IdleTimeout:       60 * time.Second,
-			ReadHeaderTimeout: 7 * time.Second,
-			ReadTimeout:       7 * time.Second,
-			WriteTimeout:      10 * time.Second,
-		}
-		logger.Info(map[string]interface{}{"event": "listen", "listen": listen})
-		for {
-			server.ListenAndServe()
-			time.Sleep(time.Second)
+
+		} else {
+			// remote unix socket backend
+			for {
+				os.Remove(listen)
+				if listener, err := net.Listen("unix", listen); err == nil {
+					os.Chmod(listen, 0666)
+					logger.Info(map[string]interface{}{"event": "listen", "listen": listen, "mode": "unix"})
+					for {
+						if handle, err := listener.Accept(); err == nil {
+							go func(handle net.Conn) {
+								body := make([]byte, 4<<10)
+								for {
+									if count, err := handle.Read(body); err == nil {
+										result, payload := map[string]interface{}{"result": false}, map[string]interface{}{}
+										if json.Unmarshal(body[:count], &payload) == nil {
+											switch jsonrpc.String(payload["method"]) {
+											case "initialize":
+												result["result"] = true
+											case "lookup":
+												MetricsCount("request", 1, map[string]interface{}{"mode": "unix"})
+												qname, qtype, remote := "", "", ""
+												for name, value := range jsonrpc.StringMap(payload["parameters"]) {
+													switch name {
+													case "qname":
+														qname = strings.ToLower(strings.TrimRight(value, "."))
+													case "qtype":
+														qtype = value
+													case "real-remote":
+														remote = value
+													}
+												}
+												records := []map[string]interface{}{}
+												for _, line := range lookup(qname, qtype, remote) {
+													if fields := strings.Split(line, "\t"); len(fields) >= 7 {
+														scope, _ := strconv.Atoi(fields[0])
+														ttl, _ := strconv.Atoi(fields[5])
+														records = append(records, map[string]interface{}{
+															"scopeMask": scope,
+															"qname":     fields[2],
+															"qtype":     fields[4],
+															"ttl":       ttl,
+															"content":   strings.Join(fields[7:], "\t"),
+														})
+													}
+												}
+												result["result"] = records
+											}
+										}
+										if payload, err := json.Marshal(result); err == nil {
+											handle.Write(payload)
+											MetricsCount("response", 1, map[string]interface{}{"mode": "unix"})
+										}
+										continue
+									}
+									break
+								}
+								handle.Close()
+							}(handle)
+						}
+					}
+					listener.Close()
+				}
+				time.Sleep(time.Second)
+			}
 		}
 
 	} else {
@@ -766,12 +826,14 @@ func backend(configuration string) error {
 						fmt.Printf("OK [%d] %s/%s ready\n", os.Getpid(), progname, version)
 					}
 				} else if len(fields) == 8 && fields[0] == "Q" && fields[2] == "IN" {
+					MetricsCount("request", 1, map[string]interface{}{"mode": "pipe"})
 					for _, line := range lookup(strings.ToLower(fields[1]), fields[3], fields[7]) {
 						if line != "" {
 							fmt.Printf("DATA\t%s\n", line)
 						}
 					}
 					fmt.Printf("END\n")
+					MetricsCount("response", 1, map[string]interface{}{"mode": "pipe"})
 				} else {
 					fmt.Printf("FAIL invalid backend request\n")
 				}

@@ -164,8 +164,8 @@ func do(name, method, url, payload string, headers map[string]string, cstatus, c
 		}
 	}
 	if metrics {
-		metricsGauge("state", int64(-strings.Index(checks[name].State, "down")), map[string]interface{}{"check": name})
-		metricsGauge("latency", int64(checks[name].Latency), map[string]interface{}{"check": name})
+		MetricsGauge("state", int64(-strings.Index(checks[name].State, "down")), map[string]interface{}{"check": name})
+		MetricsGauge("latency", int64(checks[name].Latency), map[string]interface{}{"check": name})
 	}
 	lock.Unlock()
 }
@@ -192,7 +192,7 @@ func check(listen string) {
 		}
 		lock.Unlock()
 
-		ticker := time.NewTicker(uconfig.Duration(config.GetDurationBounds("director.checks.frequency", 10, 2, 60)))
+		ticker := time.NewTicker(uconfig.Duration(config.GetDurationBounds(progname+".checks.frequency", 10, 2, 60)))
 		for {
 			select {
 			case <-ticker.C:
@@ -237,9 +237,9 @@ func check(listen string) {
 	if parts := strings.Split(listen, ","); parts[0] != "" {
 		server := &http.Server{
 			Addr:         strings.TrimLeft(parts[0], "*"),
-			ReadTimeout:  uconfig.Duration(config.GetDurationBounds("director.read_timeout", 10, 5, 30)),
-			WriteTimeout: uconfig.Duration(config.GetDurationBounds("director.write_timeout", 10, 5, 30)),
-			IdleTimeout:  uconfig.Duration(config.GetDurationBounds("director.idle_timeout", 30, 5, 30)),
+			ReadTimeout:  uconfig.Duration(config.GetDurationBounds(progname+".read_timeout", 10, 5, 30)),
+			WriteTimeout: uconfig.Duration(config.GetDurationBounds(progname+".write_timeout", 10, 5, 30)),
+			IdleTimeout:  uconfig.Duration(config.GetDurationBounds(progname+".idle_timeout", 30, 5, 30)),
 			Handler:      handler,
 		}
 		if len(parts) > 1 {

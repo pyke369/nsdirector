@@ -2,7 +2,7 @@
 
 # build targets
 nsdirector: *.go
-	@env GOPATH=/tmp/go CGO_ENABLED=0 go build -trimpath -o nsdirector
+	@env GOPATH=/tmp/go CGO_ENABLED=0 go get && go build -trimpath -o nsdirector
 	@-strip nsdirector 2>/dev/null || true
 	@-upx -9 nsdirector 2>/dev/null || true
 clean:
