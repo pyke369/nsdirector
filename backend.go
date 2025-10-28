@@ -2,28 +2,32 @@ package main
 
 import (
 	"bufio"
-	"crypto/sha1"
+	"crypto/tls"
 	"encoding/json"
-	"fmt"
 	"hash/crc32"
-	"io/ioutil"
+	"io"
+	"log"
 	"math"
 	"math/rand"
 	"net"
 	"net/http"
 	"os"
-	"regexp"
 	"runtime"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/pyke369/golang-support/dynacert"
+	"github.com/pyke369/golang-support/file"
 	"github.com/pyke369/golang-support/fqdn"
-	"github.com/pyke369/golang-support/jsonrpc"
+	j "github.com/pyke369/golang-support/jsonrpc"
 	"github.com/pyke369/golang-support/prefixdb"
+	"github.com/pyke369/golang-support/rcache"
 	"github.com/pyke369/golang-support/uconfig"
 	"github.com/pyke369/golang-support/ulog"
+	"github.com/pyke369/golang-support/uuid"
 )
 
 type CONDITION struct {
@@ -32,51 +36,44 @@ type CONDITION struct {
 	provider string
 	selector string
 }
+
 type RECORD struct {
 	name    string
 	ttl     int
 	weight  int
 	options []string
 }
+
+type REMATCH struct {
+	empty   []string
+	exclude []string
+}
+
 type RULE struct {
 	name       string
 	path       string
 	priority   int
 	affinity   bool
 	final      bool
+	group      string
 	conditions map[string]*CONDITION
 	records    map[string][]*RECORD
-}
-type BYPRIORITY []RULE
-
-func (a BYPRIORITY) Len() int      { return len(a) }
-func (a BYPRIORITY) Swap(i, j int) { a[i], a[j] = a[j], a[i] }
-func (a BYPRIORITY) Less(i, j int) bool {
-	return a[i].priority > a[j].priority ||
-		(a[i].priority == a[j].priority && strings.Compare(a[i].name, a[j].name) < 0)
+	rematch    *REMATCH
 }
 
 var (
-	config    *uconfig.UConfig
-	logger    *ulog.ULog
-	geobases  = []*prefixdb.PrefixDB{}
-	rchecks   = map[string]map[string]CHECK{}
-	watched   = map[string]string{}
-	domains   = map[string]string{}
-	entries   = map[string][]RULE{}
-	ctypes    = []string{"continent", "country", "region", "state", "asnum", "cidr", "square", "distance", "identity", "time", "availability", "latency"}
-	rtypes    = []string{"cname", "a", "aaaa", "loc", "mx", "ptr", "srv", "txt"}
-	pmatcher  = regexp.MustCompile(`^([\-+]*\d+(?:\.\d+)?)[:\|]([\-+]*(?:\d+\.\d+)?)(?:[:\|]([\-+]*\d{1,2}))?$`)
-	sqmatcher = regexp.MustCompile(`^([\-+]*\d+(?:\.\d+)?)[:\|]([\-+]*\d+(?:\.\d+)?)\s+([\-+]*\d+(?:\.\d+)?)[:\|]([\-+]*\d+(?:\.\d+)?)$`)
-	dmatcher  = regexp.MustCompile(`^\d{4}-\d{2}-\d{2}(?:[Tt]\d{2}:\d{2}(?::\d{2})?)?(?:[zZ]|[+\-]\d{2}:?\d{2})?$`)
-	tmatcher  = regexp.MustCompile(`^([01][0-9]|2[0-3]):([0-5][0-9])$`)
-	wmatcher  = regexp.MustCompile(`^(mon|tue|wed|thu|fri|sat|sun)$`)
-	weekdays  = []string{"sun", "mon", "tue", "wed", "thu", "fri", "sat"}
-	mreplacer = regexp.MustCompile(`\{\{[^\}]*\}\}`)
+	backendWatch    = map[string]string{}
+	backendGeobases = []*prefixdb.PrefixDB{}
+	backendDomains  = map[string]string{}
+	backendEntries  = map[string][]*RULE{}
+	backendChecks   = map[string]map[string]CHECK{}
+	backendCTypes   = []string{"continent", "country", "region", "state", "asnum", "cidr", "square", "distance", "identity", "time", "availability", "latency"}
+	backendRTypes   = []string{"cname", "a", "aaaa", "loc", "mx", "ptr", "srv", "txt"}
+	backendDays     = []string{"sun", "mon", "tue", "wed", "thu", "fri", "sat"}
 )
 
-func parseRecord(rtype, input string, ttl int) (record *RECORD) {
-	if fields := strings.Split(input, "|"); len(fields) > 0 {
+func backendParse(rtype, in string, ttl int) (record *RECORD) {
+	if fields := strings.Split(in, "|"); len(fields) > 0 {
 		if value := strings.TrimSpace(fields[0]); value != "" {
 			record = &RECORD{name: value, ttl: ttl, weight: 1}
 			if len(fields) > 1 {
@@ -92,8 +89,8 @@ func parseRecord(rtype, input string, ttl int) (record *RECORD) {
 			if len(fields) > 3 && (rtype == "mx" || rtype == "srv") {
 				record.options = fields[3:]
 			}
+
 			switch rtype {
-			case "loc": // TODO not implemented yet
 			case "mx":
 				if len(record.options) < 1 {
 					return nil
@@ -102,6 +99,7 @@ func parseRecord(rtype, input string, ttl int) (record *RECORD) {
 					return nil
 				}
 				record.options = record.options[:1]
+
 			case "srv":
 				if len(record.options) < 3 {
 					return nil
@@ -117,213 +115,209 @@ func parseRecord(rtype, input string, ttl int) (record *RECORD) {
 				}
 				record.options = record.options[:3]
 
+			case "loc": // TODO not implemented yet
 			}
 		}
 	}
+
 	return
 }
 
-func loadCaches() {
-	if config != nil {
-		ndomains, nentries := map[string]string{}, map[string][]RULE{}
-		for _, path := range config.GetPaths("domains") {
-			if domain := strings.TrimSpace(config.GetString(path+".name", "")); domain != "" {
-				ndomains[domain] = path
-				ttl := int(config.GetIntegerBounds(path+".ttl", 600, 10, 86400))
-				for _, path := range config.GetPaths(path + ".entries") {
-					if entry := strings.TrimSpace(config.GetString(path+".name", "")); entry != "" {
+func backendLoadGeobases(config *uconfig.UConfig, logger *ulog.ULog) {
+	bases := []*prefixdb.PrefixDB{}
+	for _, path := range config.Strings("geobase") {
+		base := prefixdb.New()
+		if err := base.Load(path); err == nil {
+			bases = append(bases, base)
+			logger.Info(map[string]any{
+				"pid":         os.Getpid(),
+				"scope":       "backend",
+				"event":       "geobase",
+				"path":        path,
+				"description": base.Description,
+			})
+		}
+	}
+	backendGeobases = bases
+	runtime.GC()
+}
 
-						rules := []RULE{}
-						for _, rpath := range config.GetPaths(path + ".rules") {
-							rule := RULE{
-								name:       strings.ToLower(strings.TrimPrefix(rpath, path+".rules.")),
-								path:       path,
-								priority:   int(config.GetIntegerBounds(rpath+".priority", 1, 1, 100)),
-								affinity:   config.GetBoolean(rpath+".affinity", true),
-								final:      config.GetBoolean(rpath+".final", true),
-								conditions: map[string]*CONDITION{},
-								records:    map[string][]*RECORD{},
+func backendLoadEntries(config *uconfig.UConfig) {
+	ndomains, nentries := map[string]string{}, map[string][]*RULE{}
+	for _, path := range config.Paths("domains") {
+		if domain := strings.TrimSpace(config.String(config.Path(path, "name"))); domain != "" {
+			ndomains[domain] = path
+			ttl := int(config.IntegerBounds(config.Path(path, "ttl"), 600, 10, 86400))
+			for _, path := range config.Paths(config.Path(path, "entries")) {
+				if entry := strings.TrimSpace(config.String(config.Path(path, "name"))); entry != "" {
+					rules := []*RULE{}
+					for _, rpath := range config.Paths(config.Path(path, "rules")) {
+						rule := &RULE{
+							name:       strings.ToLower(config.Base(rpath)),
+							path:       path,
+							priority:   int(config.IntegerBounds(config.Path(rpath, "priority"), 1, 1, 100)),
+							affinity:   config.Boolean(config.Path(rpath, "affinity"), true),
+							final:      config.Boolean(config.Path(rpath, "final"), true),
+							group:      config.String(config.Path(rpath, "group")),
+							conditions: map[string]*CONDITION{},
+							records:    map[string][]*RECORD{},
+						}
+
+						for _, ctype := range backendCTypes {
+							for _, value := range config.Strings(config.Path(rpath, ctype, "include")) {
+								if rule.conditions[ctype] == nil {
+									rule.conditions[ctype] = &CONDITION{}
+								}
+								rule.conditions[ctype].include = append(rule.conditions[ctype].include, strings.ToLower(value))
 							}
-
-							for _, ctype := range ctypes {
-								if cvalue := strings.TrimSpace(config.GetString(rpath+"."+ctype+".include", "")); cvalue != "" {
-									if rule.conditions[ctype] == nil {
-										rule.conditions[ctype] = &CONDITION{}
-									}
-									rule.conditions[ctype].include = append(rule.conditions[ctype].include, strings.ToLower(cvalue))
+							for _, value := range config.Strings(config.Path(rpath, ctype, "exclude")) {
+								if rule.conditions[ctype] == nil {
+									rule.conditions[ctype] = &CONDITION{}
 								}
-								for _, cpath := range config.GetPaths(rpath + "." + ctype + ".include") {
-									if cvalue := strings.TrimSpace(config.GetString(cpath, "")); cpath != "" {
-										if rule.conditions[ctype] == nil {
-											rule.conditions[ctype] = &CONDITION{}
-										}
-										rule.conditions[ctype].include = append(rule.conditions[ctype].include, strings.ToLower(cvalue))
-									}
-								}
-								if cvalue := strings.TrimSpace(config.GetString(rpath+"."+ctype+".exclude", "")); cvalue != "" {
-									if rule.conditions[ctype] == nil {
-										rule.conditions[ctype] = &CONDITION{}
-									}
-									rule.conditions[ctype].exclude = append(rule.conditions[ctype].exclude, strings.ToLower(cvalue))
-								}
-								for _, cpath := range config.GetPaths(rpath + "." + ctype + ".exclude") {
-									if cvalue := strings.TrimSpace(config.GetString(cpath, "")); cvalue != "" {
-										if rule.conditions[ctype] == nil {
-											rule.conditions[ctype] = &CONDITION{}
-										}
-										rule.conditions[ctype].exclude = append(rule.conditions[ctype].exclude, strings.ToLower(cvalue))
-									}
-								}
-
-								if cvalue := strings.TrimSpace(config.GetString(rpath+"."+ctype+".provider", "")); cvalue != "" {
-									if rule.conditions[ctype] == nil {
-										rule.conditions[ctype] = &CONDITION{}
-									}
-									rule.conditions[ctype].provider = cvalue
-								}
-								if cvalue := strings.TrimSpace(config.GetString(rpath+"."+ctype+".selector", "")); cvalue != "" {
-									if rule.conditions[ctype] == nil {
-										rule.conditions[ctype] = &CONDITION{}
-									}
-									rule.conditions[ctype].selector = strings.ToLower(cvalue)
-								}
+								rule.conditions[ctype].exclude = append(rule.conditions[ctype].exclude, strings.ToLower(value))
 							}
-
-							for _, rtype := range rtypes {
-								if rentry := strings.TrimSpace(config.GetString(rpath+".records."+rtype, "")); rentry != "" {
-									if rvalue := parseRecord(rtype, rentry, ttl); rvalue != nil {
-										rule.records[rtype] = append(rule.records[rtype], rvalue)
-									}
+							for _, value := range config.Strings(config.Path(rpath, ctype, "provider")) {
+								if rule.conditions[ctype] == nil {
+									rule.conditions[ctype] = &CONDITION{}
 								}
-								for _, rpath := range config.GetPaths(rpath + ".records." + rtype) {
-									if rentry := strings.TrimSpace(config.GetString(rpath, "")); rentry != "" {
-										if rvalue := parseRecord(rtype, rentry, ttl); rvalue != nil {
-											rule.records[rtype] = append(rule.records[rtype], rvalue)
-										}
-									}
-								}
+								rule.conditions[ctype].provider = value
+								break
 							}
-							if rule.records != nil {
-								rules = append(rules, rule)
+							for _, value := range config.Strings(config.Path(rpath, ctype, "selector")) {
+								if rule.conditions[ctype] == nil {
+									rule.conditions[ctype] = &CONDITION{}
+								}
+								rule.conditions[ctype].selector = strings.ToLower(value)
+								break
 							}
 						}
-						sort.Sort(BYPRIORITY(rules))
-						nentries[entry+"."+domain] = rules
+
+						for _, rtype := range backendRTypes {
+							for _, value := range config.Strings(config.Path(rpath, "records", rtype)) {
+								if record := backendParse(rtype, value, ttl); record != nil {
+									rule.records[rtype] = append(rule.records[rtype], record)
+								}
+							}
+						}
+						empty, exclude := []string{}, config.Strings(config.Path(rpath, "rematch", "exclude"))
+						for _, rtype := range config.Strings(config.Path(rpath, "rematch", "empty")) {
+							if rtype := strings.ToLower(rtype); slices.Contains(backendRTypes, rtype) {
+								empty = append(empty, rtype)
+							}
+						}
+						if len(empty) != 0 && len(exclude) != 0 {
+							for index := 0; index < len(exclude); index++ {
+								exclude[index] = strings.ToLower(exclude[index])
+							}
+							rule.rematch = &REMATCH{empty, exclude}
+						}
+
+						if len(rule.records) != 0 || rule.rematch != nil {
+							rules = append(rules, rule)
+						}
 					}
+					sort.Slice(rules, func(i, j int) bool {
+						if rules[i].priority > rules[j].priority {
+							return true
+						}
+						if rules[i].priority == rules[j].priority {
+							if rules[i].group < rules[j].group {
+								return true
+							}
+							if rules[i].group == rules[j].group {
+								return rules[i].name < rules[j].name
+							}
+						}
+						return false
+					})
+					nentries[entry+"."+domain] = rules
 				}
 			}
 		}
-		domains = ndomains
-		entries = nentries
 	}
+	backendDomains, backendEntries = ndomains, nentries
 }
 
-func loadGeobases() {
-	if config != nil {
-		bases := []*prefixdb.PrefixDB{}
-		for _, path := range config.GetPaths(progname + ".geobases") {
-			base := prefixdb.New()
-			if err := base.Load(config.GetString(path, "")); err == nil {
-				bases = append(bases, base)
+func backendReload(config *uconfig.UConfig, logger *ulog.ULog) {
+	changes := false
+	for _, path := range config.Strings("watch") {
+		if info, err := os.Stat(path); err == nil {
+			if time.Since(info.ModTime()) >= 5*time.Second {
+				sum, _ := file.Sum(path)
+				if osum, exists := backendWatch[path]; !exists || (exists && osum != sum) {
+					changes = true
+				}
+				backendWatch[path] = sum
 			}
-		}
-		geobases = bases
-		runtime.GC()
-	}
-}
 
-func reload() {
-	loadGeobases()
-	for range time.Tick(5 * time.Second) {
-		if config != nil {
-			changes := false
-			for _, path := range config.GetPaths(progname + ".watch") {
-				path = strings.TrimSpace(config.GetString(path, ""))
-				if info, err := os.Stat(path); err == nil {
-					if time.Now().Sub(info.ModTime()) >= 5*time.Second {
-						if content, err := ioutil.ReadFile(path); err == nil {
-							sum := fmt.Sprintf("%x", sha1.Sum(content))
-							if osum, ok := watched[path]; ok {
-								if osum != sum {
-									changes = true
-								}
-							}
-							watched[path] = sum
-						}
-					}
-				} else {
-					watched[path] = ""
+		} else {
+			backendWatch[path] = ""
+		}
+	}
+	if changes {
+		config.Reload()
+		logger.Load(config.String("log", "console()"))
+		logger.Info(map[string]any{
+			"pid":     os.Getpid(),
+			"scope":   "backend",
+			"event":   "reload",
+			"version": PROGVER,
+		})
+		backendLoadGeobases(config, logger)
+		backendLoadEntries(config)
+		go Check(config, logger)
+	}
+
+	client, checks := &http.Client{Timeout: 5 * time.Second}, map[string]map[string]CHECK{}
+	for _, path := range config.Paths(config.Path("check", "source")) {
+		if response, err := client.Get(config.String(path, "")); err == nil {
+			if body, err := io.ReadAll(response.Body); err == nil {
+				result := map[string]CHECK{}
+				if json.Unmarshal(body, &result) == nil {
+					checks[config.Base(path)] = result
 				}
 			}
-			if changes {
-				config.Reload()
-				logger.Load(config.GetString(progname+".log", "console()"))
-				logger.Info(map[string]interface{}{"event": "reload", "pid": os.Getpid(), "version": version})
-				loadCaches()
-				loadGeobases()
-			}
-
-			if listen := config.GetStringMatch(progname+".checks.local.listen", "", `^.*?(:\d+)?((,[^,]+){2})?$`); listen != "" {
-				go check(listen)
-			}
-			client, nrchecks := &http.Client{Timeout: 5 * time.Second}, map[string]map[string]CHECK{}
-			for _, path := range config.GetPaths(progname + ".checks.remote") {
-				if response, err := client.Get(config.GetString(path, "")); err == nil {
-					if body, err := ioutil.ReadAll(response.Body); err == nil {
-						result := map[string]CHECK{}
-						if json.Unmarshal(body, &result) == nil {
-							nrchecks[strings.TrimPrefix(path, progname+".checks.remote.")] = result
-						}
-					}
-					response.Body.Close()
-				}
-			}
-			rchecks = nrchecks
+			response.Body.Close()
 		}
 	}
+	backendChecks = checks
 }
 
-func instrings(array []string, search string) bool {
-	for _, value := range array {
-		if value == search {
-			return true
-		}
-	}
-	return false
-}
-func innets(array []string, address string) bool {
+func backendNets(in []string, address string) bool {
 	if ip := net.ParseIP(address); ip != nil {
-		for _, value := range array {
+		for _, value := range in {
 			if _, network, err := net.ParseCIDR(value); err == nil {
 				if network.Contains(ip) {
 					return true
 				}
-			} else {
-				break
 			}
 		}
 	}
+
 	return false
 }
-func insquares(array []string, lat, lon float64) bool {
-	for _, value := range array {
-		if matches := sqmatcher.FindStringSubmatch(value); len(matches) >= 5 {
-			lat1, _ := strconv.ParseFloat(matches[1], 64)
-			lon1, _ := strconv.ParseFloat(matches[2], 64)
-			lat2, _ := strconv.ParseFloat(matches[3], 64)
-			lon2, _ := strconv.ParseFloat(matches[4], 64)
-			if lat >= -90 && lat <= 90 && lon >= -180 && lon <= 180 &&
-				lat1 >= -90 && lat1 <= 90 && lon1 >= -180 && lon1 <= 180 &&
-				lat2 >= -90 && lat2 <= 90 && lon2 >= -180 && lon2 <= 180 &&
-				lat1 > lat2 && lon1 < lon2 &&
-				lat1 >= lat && lat >= lat2 && lon1 <= lon && lon <= lon2 {
-				return true
-			}
+
+func backendSquares(in []string, lat, lon float64) bool {
+	matcher := rcache.Get(`^([\-+]*\d+(?:\.\d+)?)[:\|]([\-+]*\d+(?:\.\d+)?)\s+([\-+]*\d+(?:\.\d+)?)[:\|]([\-+]*\d+(?:\.\d+)?)$`)
+	for _, value := range in {
+		captures := matcher.FindStringSubmatch(value)
+		if captures == nil {
+			continue
+		}
+		lat1, lon1, lat2, lon2 := j.Number(captures[1]), j.Number(captures[2]), j.Number(captures[3]), j.Number(captures[4])
+		if lat >= -90 && lat <= 90 && lon >= -180 && lon <= 180 &&
+			lat1 >= -90 && lat1 <= 90 && lon1 >= -180 && lon1 <= 180 &&
+			lat2 >= -90 && lat2 <= 90 && lon2 >= -180 && lon2 <= 180 &&
+			lat1 > lat2 && lon1 < lon2 &&
+			lat1 >= lat && lat >= lat2 && lon1 <= lon && lon <= lon2 {
+			return true
 		}
 	}
+
 	return false
 }
-func distance(lat1, lon1, lat2, lon2 float64) float64 {
+
+func backendDistance(lat1, lon1, lat2, lon2 float64) float64 {
 	if (lat1 == 0 && lon1 == 0) || (lat2 == 0 && lon2 == 0) {
 		return -1
 	}
@@ -334,53 +328,72 @@ func distance(lat1, lon1, lat2, lon2 float64) float64 {
 	dlat, dlon := (lat2-lat1)/2, (lon2-lon1)/2
 	a := (math.Sin(dlat) * math.Sin(dlat)) + math.Cos(lat1)*math.Cos(lat2)*(math.Sin(dlon)*math.Sin(dlon))
 	d := 2 * math.Atan2(math.Sqrt(a), math.Sqrt(1-a))
+
 	return (6378137 * d) / 1000
 }
-func nearest(lat1, lon1 float64, selector string) string {
-	max, name := 100000.0, ""
-	for _, path := range config.GetPaths(selector) {
-		if matches := pmatcher.FindStringSubmatch(config.GetString(path, "")); len(matches) >= 4 {
-			lat2, _ := strconv.ParseFloat(matches[1], 64)
-			lon2, _ := strconv.ParseFloat(matches[2], 64)
-			value := distance(lat1, lon1, lat2, lon2)
-			if bias, err := strconv.ParseFloat(matches[3], 64); err == nil {
-				if bias > 0 {
-					value = value * (1 - (bias / 100))
-				} else {
-					value = value / (1 + (bias / 100))
-				}
-			}
-			if value < max {
-				max, name = value, strings.TrimPrefix(path, selector+".")
+
+func backendNearest(config *uconfig.UConfig, lat1, lon1 float64, selector string, extra ...[]string) string {
+	highest, name, matcher, exclude := 100000.0, "", rcache.Get(`^([\-+]*\d+(?:\.\d+)?)[:\|]([\-+]*(?:\d+\.\d+)?)(?:[:\|]([\-+]*\d{1,2}))?$`), []string{}
+	if len(extra) != 0 {
+		exclude = extra[0]
+	}
+
+	for _, path := range config.Paths(selector) {
+		if slices.Contains(exclude, config.Base(path)) {
+			continue
+		}
+
+		captures := matcher.FindStringSubmatch(config.String(path))
+		if captures == nil {
+			continue
+		}
+
+		lat2, lon2 := j.Number(captures[1]), j.Number(captures[2])
+		value := backendDistance(lat1, lon1, lat2, lon2)
+		if bias := j.Number(captures[3]); bias != 0 {
+			if bias > 0 {
+				value *= (1 - (bias / 100))
+
+			} else {
+				value /= (1 + (bias / 100))
 			}
 		}
+		if value < highest {
+			highest, name = value, config.Base(path)
+		}
 	}
+
 	return name
 }
-func intimes(array []string) bool {
+
+func backendTimes(in []string) bool {
 	now := time.Now()
-	for _, value := range array {
+	dmatcher := rcache.Get(`^\d{4}-\d{2}-\d{2}(?:[Tt]\d{2}:\d{2}(?::\d{2})?)?(?:[zZ]|[+\-]\d{2}:?\d{2})?$`)
+	tmatcher := rcache.Get(`^([01]\d|2[0-3]):([0-5]\d)$`)
+	for _, value := range in {
 		for _, predicate := range strings.Split(value, "|") {
-			parts := strings.Split(strings.TrimSpace(predicate), " ")
-			for index, _ := range parts {
-				parts[index] = strings.TrimSpace(parts[index])
+			parts := strings.Fields(predicate)
+			if len(parts) == 0 {
+				continue
 			}
 			if dmatcher.MatchString(parts[0]) {
 				if start, err := time.Parse(time.RFC3339, strings.ToUpper(parts[0])); err != nil {
 					return false
+
 				} else if now.Sub(start) < 0 {
 					return false
-				} else {
-					if len(parts) >= 2 {
-						if end, err := time.Parse(time.RFC3339, strings.ToUpper(parts[1])); err != nil {
-							return false
-						} else if now.Sub(end) >= 0 {
-							return false
-						}
+
+				} else if len(parts) >= 2 {
+					if end, err := time.Parse(time.RFC3339, strings.ToUpper(parts[1])); err != nil {
+						return false
+
+					} else if now.Sub(end) >= 0 {
+						return false
 					}
 				}
-			} else if wmatcher.MatchString(parts[0]) {
-				day, matched := weekdays[now.Weekday()], false
+
+			} else if rcache.Get(`^(mon|tue|wed|thu|fri|sat|sun)$`).MatchString(parts[0]) {
+				day, matched := backendDays[now.Weekday()], false
 				for _, pday := range parts {
 					if day == pday {
 						matched = true
@@ -390,18 +403,21 @@ func intimes(array []string) bool {
 				if !matched {
 					return false
 				}
-			} else if matches := tmatcher.FindStringSubmatch(parts[0]); matches != nil {
-				hours, _ := strconv.Atoi(matches[1])
-				minutes, _ := strconv.Atoi(matches[2])
+
+			} else if captures := tmatcher.FindStringSubmatch(parts[0]); captures != nil {
+				hours, _ := strconv.Atoi(captures[1])
+				minutes, _ := strconv.Atoi(captures[2])
 				if (now.UTC().Hour()*60)+now.UTC().Minute() < (hours*60)+minutes {
 					return false
 				}
+
 				if len(parts) >= 2 {
-					if matches := tmatcher.FindStringSubmatch(parts[1]); matches == nil {
+					if captures := tmatcher.FindStringSubmatch(parts[1]); captures == nil {
 						return false
+
 					} else {
-						hours, _ := strconv.Atoi(matches[1])
-						minutes, _ := strconv.Atoi(matches[2])
+						hours, _ := strconv.Atoi(captures[1])
+						minutes, _ := strconv.Atoi(captures[2])
 						if (now.UTC().Hour()*60)+now.UTC().Minute() >= (hours*60)+minutes {
 							return false
 						}
@@ -410,33 +426,37 @@ func intimes(array []string) bool {
 			}
 		}
 	}
+
 	return true
 }
-func passed(array []string) bool {
-	if len(rchecks) == 0 {
+
+func backendPassed(in []string) bool {
+	if len(backendChecks) == 0 {
 		return true
 	}
-	for _, check := range array {
-		remote := ""
+
+	for _, check := range in {
+		source := ""
 		if parts := strings.Split(check, "@"); len(parts) > 1 {
-			check, remote = parts[0], parts[1]
+			check, source = parts[0], parts[1]
 		}
-		if remote != "" {
-			if value, ok := rchecks[remote]; !ok {
+		if source != "" {
+			if value, exists := backendChecks[source]; !exists {
 				continue
+
 			} else {
-				if value, ok := value[check]; !ok {
+				if value, exists := value[check]; !exists {
 					return true
-				} else {
-					if value.State == "up" {
-						return true
-					}
+
+				} else if value.State == "up" {
+					return true
 				}
 			}
+
 		} else {
 			found := false
-			for _, value := range rchecks {
-				if value, ok := value[check]; ok {
+			for _, value := range backendChecks {
+				if value, exists := value[check]; exists {
 					found = true
 					if value.State == "up" {
 						return true
@@ -447,12 +467,12 @@ func passed(array []string) bool {
 				return true
 			}
 		}
-
 	}
+
 	return false
 }
 
-func response(qname, rtype string, record *RECORD, rfields map[string]string) string {
+func backendResponse(qname, rtype string, record *RECORD, rfields map[string]string) string {
 	line, name := "", record.name
 	for key, value := range rfields {
 		if key == "cncode" || key == "ccode" || key == "asnum" {
@@ -460,163 +480,174 @@ func response(qname, rtype string, record *RECORD, rfields map[string]string) st
 		}
 		name = strings.ReplaceAll(name, "{{"+key+"}}", value)
 	}
-	name = mreplacer.ReplaceAllString(name, "")
+	name = rcache.Get(`\{\{[^\}]*\}\}`).ReplaceAllString(name, "")
+
 	switch rtype {
 	case "a", "aaaa", "cname", "ptr":
-		line = fmt.Sprintf("%s\t1\t%s\tIN\t%s\t%d\t-1\t%s", rfields["bits"], qname, strings.ToUpper(rtype), record.ttl, name)
-	case "loc": // TODO not implemented yet
+		line = rfields["bits"] + "\t1\t" + qname + "\tIN\t" + strings.ToUpper(rtype) + "\t" + strconv.Itoa(record.ttl) + "\t-1\t" + name
+
 	case "mx":
-		line = fmt.Sprintf("%s\t1\t%s\tIN\tMX\t%d\t-1\t%s\t%s", rfields["bits"], qname, record.ttl, record.options[0], name)
+		line = rfields["bits"] + "\t1\t" + qname + "\tIN\tMX\t" + strconv.Itoa(record.ttl) + "\t-1\t" + record.options[0] + "\t" + name
+
 	case "srv":
-		line = fmt.Sprintf("%s\t1\t%s\tIN\tSRV\t%d\t-1\t%s\t%s %s %s", rfields["bits"], qname, record.ttl, record.options[0], record.options[1], record.options[2], name)
+		line = rfields["bits"] + "\t1\t" + qname + "\tIN\tSRV\t" + strconv.Itoa(record.ttl) + "\t-1\t" + record.options[0] + "\t" + record.options[1] + " " + record.options[2] + " " + name
+
 	case "txt":
-		line = fmt.Sprintf("%s\t1\t%s\tIN\tTXT\t%d\t-1\t\"%s\"", rfields["bits"], qname, record.ttl, strings.ReplaceAll(name, `"`, `\"`))
+		line = rfields["bits"] + "\t1\t" + qname + "\tIN\tTXT\t" + strconv.Itoa(record.ttl) + "\t-1\t" + `"` + strings.ReplaceAll(name, `"`, `\"`) + `"`
+
+	case "loc": // TODO not implemented yet
 	}
+
 	return line
 }
 
-func lookup(qname, qtype, remote string) (result []string) {
+func backendLookup(config *uconfig.UConfig, qname, qtype, remote string) (result []string) {
 	result = []string{}
-	if config != nil {
-		length := len(entries[qname])
-		if domains[qname] != "" || length > 0 {
-			domain := qname
-			if length > 0 {
-				domain = strings.SplitN(qname, ".", 2)[1]
+	length := len(backendEntries[qname])
+	if backendDomains[qname] != "" || length > 0 {
+		domain := qname
+		if length > 0 {
+			domain = strings.SplitN(qname, ".", 2)[1]
+		}
+		if qtype == "SOA" || qtype == "ANY" {
+			server, contact := config.Strings(config.Path(backendDomains[domain], "servers"), []string{"ns." + domain})[0], config.String(config.Path(backendDomains[domain], "contact"), "contact@"+domain)
+			if index := strings.Index(contact, "@"); index > 0 && index < len(contact)-1 {
+				contact = strings.ReplaceAll(contact[:index], ".", `\.`) + "." + contact[index+1:]
 			}
-			ttl := config.GetIntegerBounds(domains[domain]+".ttl", 600, 10, 86400)
-			if qtype == "SOA" || qtype == "ANY" {
-				contact := config.GetString(domains[domain]+".contact", "contact@"+domain)
-				if index := strings.Index(contact, "@"); index > 0 && index < len(contact)-1 {
-					contact = strings.ReplaceAll(contact[:index], ".", `\.`) + "." + contact[index+1:]
+			contact = strings.ReplaceAll(contact, "@", ".")
+			result = append(result, "0\t1\t"+qname+"\tIN\tSOA\t7200\t-1\t"+server+"\t"+contact+"\t"+time.Now().UTC().Format("2006010215")+"\t86400\t7200\t604800\t172800")
+		}
+		if qtype == "NS" || qtype == "ANY" {
+			for _, path := range config.Paths(config.Path(backendDomains[domain], "servers")) {
+				if server := strings.TrimSpace(config.String(path)); server != "" {
+					result = append(result, "0\t1\t"+qname+"\tIN\tNS\t7200\t-1\t"+server)
 				}
-				contact = strings.ReplaceAll(contact, "@", ".")
-				server := strings.TrimSpace(config.GetString(domains[domain]+".servers.0", "ns."+domain))
-				result = append(result, fmt.Sprintf("0\t1\t%s\tIN\tSOA\t%d\t-1\t%s\t%s\t%s\t86400\t7200\t604800\t172800",
-					qname, ttl, server, contact, time.Now().UTC().Format("2006010215")))
 			}
-			if qtype == "NS" || qtype == "ANY" {
-				for _, path := range config.GetPaths(domains[domain] + ".servers") {
-					if server := strings.TrimSpace(config.GetString(path, "")); server != "" {
-						result = append(result, fmt.Sprintf("0\t1\t%s\tIN\tNS\t%d\t-1\t%s", qname, ttl, server))
-					}
+		}
+
+		if length > 0 && qtype != "SOA" && qtype != "NS" {
+			rfields := map[string]string{"remote": "0.0.0.0", "bits": "32", "identity": config.String("identity")}
+			rfields["hostname"], _ = fqdn.FQDN()
+			if address, network, err := net.ParseCIDR(remote); err == nil {
+				bits, _ := network.Mask.Size()
+				rfields["bits"] = strconv.Itoa(bits)
+				rfields["remote"] = address.String()
+
+				geoinfo := map[string]any{}
+				for _, base := range backendGeobases {
+					base.Lookup(address.String(), geoinfo)
+				}
+				if value := strings.ToLower(j.String(geoinfo["continent_code"])); value != "" {
+					rfields["continent"], rfields["cncode"] = value, value
+				}
+				if value := j.String(geoinfo["continent_name"]); value != "" {
+					rfields["cnname"] = value
+				}
+				if value := strings.ToLower(j.String(geoinfo["country_code"])); value != "" {
+					rfields["country"], rfields["ccode"] = value, value
+				}
+				if value := j.String(geoinfo["country_name"]); value != "" {
+					rfields["cname"] = value
+				}
+				if value := j.String(geoinfo["region_code"]); value != "" {
+					rfields["region"], rfields["rcode"] = strings.ToLower(value), value
+				}
+				if value := j.String(geoinfo["region_name"]); value != "" {
+					rfields["rname"] = value
+				}
+				if value := j.String(geoinfo["state_code"]); value != "" {
+					rfields["state"], rfields["scode"] = strings.ToLower(value), value
+				}
+				if value := j.String(geoinfo["state_name"]); value != "" {
+					rfields["sname"] = value
+				}
+				if value := j.String(geoinfo["city_name"]); value != "" {
+					rfields["city"] = value
+				}
+				if value := strings.ToLower(j.String(geoinfo["as_number"])); value != "" {
+					rfields["asnum"] = value
+				}
+				if value := j.String(geoinfo["as_name"]); value != "" {
+					rfields["asname"] = value
+				}
+				if value := j.Number(geoinfo["latitude"], -1000); value != -1000 {
+					rfields["latitude"] = strconv.FormatFloat(value, 'f', -1, 64)
+					rfields["lat"] = rfields["latitude"]
+				}
+				if value := j.Number(geoinfo["longitude"], -1000); value != -1000 {
+					rfields["longitude"] = strconv.FormatFloat(value, 'f', -1, 64)
+					rfields["lon"] = rfields["longitude"]
 				}
 			}
 
-			if length > 0 && qtype != "SOA" && qtype != "NS" {
-				rfields := map[string]string{"remote": "0.0.0.0", "bits": "32", "identity": config.GetString(progname+".identity", "")}
-				rfields["hostname"], _ = fqdn.FQDN()
-				if address, network, err := net.ParseCIDR(remote); err == nil {
-					bits, _ := network.Mask.Size()
-					rfields["bits"] = fmt.Sprintf("%d", bits)
-					rfields["remote"] = fmt.Sprintf("%s", address)
-					geoinfo := map[string]interface{}{}
-					for _, base := range geobases {
-						geoinfo, _ = base.Lookup(address, geoinfo)
-					}
-					if geoinfo["continent_code"] != nil {
-						rfields["continent"] = strings.ToLower(geoinfo["continent_code"].(string))
-						rfields["cncode"] = rfields["continent"]
-					}
-					if geoinfo["continent_name"] != nil {
-						rfields["cnname"] = geoinfo["continent_name"].(string)
-					}
-					if geoinfo["country_code"] != nil {
-						rfields["country"] = strings.ToLower(geoinfo["country_code"].(string))
-						rfields["ccode"] = rfields["country"]
-					}
-					if geoinfo["country_name"] != nil {
-						rfields["cname"] = geoinfo["country_name"].(string)
-					}
-					if geoinfo["region_code"] != nil {
-						rfields["region"] = strings.ToLower(geoinfo["region_code"].(string))
-						rfields["rcode"] = geoinfo["region_code"].(string)
-					}
-					if geoinfo["region_name"] != nil {
-						rfields["rname"] = geoinfo["region_name"].(string)
-					}
-					if geoinfo["state_code"] != nil {
-						rfields["state"] = strings.ToLower(geoinfo["state_code"].(string))
-						rfields["scode"] = geoinfo["state_code"].(string)
-					}
-					if geoinfo["state_name"] != nil {
-						rfields["sname"] = geoinfo["state_name"].(string)
-					}
-					if geoinfo["city_name"] != nil {
-						rfields["city"] = geoinfo["city_name"].(string)
-					}
-					if geoinfo["as_number"] != nil {
-						rfields["asnum"] = strings.ToLower(geoinfo["as_number"].(string))
-					}
-					if geoinfo["as_name"] != nil {
-						rfields["asname"] = geoinfo["as_name"].(string)
-					}
-					if geoinfo["latitude"] != nil {
-						rfields["latitude"] = fmt.Sprintf("%f", geoinfo["latitude"].(float64))
-						rfields["lat"] = rfields["latitude"]
-					}
-					if geoinfo["longitude"] != nil {
-						rfields["longitude"] = fmt.Sprintf("%f", geoinfo["longitude"].(float64))
-						rfields["lon"] = rfields["longitude"]
-					}
-				}
-
-				records, affinity := map[string][]*RECORD{}, true
-				for _, rule := range entries[qname] {
+			records, exclude, matcher, affinity := map[string][]*RECORD{}, []string{}, rcache.Get(`^([\-+]*\d+(?:\.\d+)?)[:\|]([\-+]*(?:\d+\.\d+)?)(?:[:\|]([\-+]*\d{1,2}))?$`), true
+		done:
+			for rematch := 1; rematch <= int(config.IntegerBounds("rematch", 5, 1, 10)); rematch++ {
+				records = map[string][]*RECORD{}
+				completed := true
+				for _, rule := range backendEntries[qname] {
 					match := true
-					affinity = rule.affinity
-					for _, ctype := range ctypes {
+					for _, ctype := range backendCTypes {
 						if condition := rule.conditions[ctype]; condition != nil {
 							switch ctype {
 							case "continent", "country", "region", "state", "asnum", "identity":
 								if rfields[ctype] == "" {
 									match = false
-								} else if (len(condition.include) > 0 && !instrings(condition.include, rfields[ctype])) ||
-									(len(condition.exclude) > 0 && instrings(condition.exclude, rfields[ctype])) {
+
+								} else if (len(condition.include) > 0 && !slices.Contains(condition.include, rfields[ctype])) ||
+									(len(condition.exclude) > 0 && slices.Contains(condition.exclude, rfields[ctype])) {
 									match = false
 								}
+
 							case "cidr":
-								if (len(condition.include) > 0 && !innets(condition.include, rfields["remote"])) ||
-									(len(condition.exclude) > 0 && innets(condition.exclude, rfields["remote"])) {
+								if (len(condition.include) > 0 && !backendNets(condition.include, rfields["remote"])) ||
+									(len(condition.exclude) > 0 && backendNets(condition.exclude, rfields["remote"])) {
 									match = false
 								}
+
 							case "square", "distance":
-								if matches := pmatcher.FindStringSubmatch(rfields["latitude"] + ":" + rfields["longitude"]); len(matches) < 4 {
+								if captures := matcher.FindStringSubmatch(rfields["latitude"] + ":" + rfields["longitude"]); captures == nil {
 									match = false
+
 								} else {
-									lat, _ := strconv.ParseFloat(matches[1], 64)
-									lon, _ := strconv.ParseFloat(matches[2], 64)
+									lat, lon := j.Number(captures[1]), j.Number(captures[2])
 									switch ctype {
 									case "square":
-										if (len(condition.include) > 0 && !insquares(condition.include, lat, lon)) ||
-											(len(condition.exclude) > 0 && insquares(condition.exclude, lat, lon)) {
+										if (len(condition.include) > 0 && !backendSquares(condition.include, lat, lon)) ||
+											(len(condition.exclude) > 0 && backendSquares(condition.exclude, lat, lon)) {
 											match = false
 										}
+
 									case "distance":
 										selector := condition.selector
 										if selector[0] == '/' {
 											selector = selector[1:]
+
 										} else {
-											selector = rule.path + "." + selector
+											selector = config.Path(rule.path, selector)
 										}
-										if name := nearest(lat, lon, selector); name == "" {
+										if name := backendNearest(config, lat, lon, selector, exclude); name == "" {
 											match = false
-										} else if (len(condition.include) > 0 && !instrings(condition.include, name)) ||
-											(len(condition.exclude) > 0 && instrings(condition.exclude, name)) {
+
+										} else if (len(condition.include) > 0 && !slices.Contains(condition.include, name)) ||
+											(len(condition.exclude) > 0 && slices.Contains(condition.exclude, name)) {
 											match = false
 										}
 									}
 								}
+
 							case "time":
-								if (len(condition.include) > 0 && !intimes(condition.include)) ||
-									(len(condition.exclude) > 0 && intimes(condition.exclude)) {
+								if (len(condition.include) > 0 && !backendTimes(condition.include)) ||
+									(len(condition.exclude) > 0 && backendTimes(condition.exclude)) {
 									match = false
 								}
+
 							case "availability":
-								if (len(condition.include) > 0 && !passed(condition.include)) ||
-									(len(condition.exclude) > 0 && passed(condition.exclude)) {
+								if (len(condition.include) > 0 && !backendPassed(condition.include)) ||
+									(len(condition.exclude) > 0 && backendPassed(condition.exclude)) {
 									match = false
 								}
+
 							case "latency": // TODO not implemented yet
 							}
 						}
@@ -625,222 +656,270 @@ func lookup(qname, qtype, remote string) (result []string) {
 						}
 					}
 					if match {
-						for rtype, value := range rule.records {
-							records[rtype] = append(records[rtype], value...)
+						for rtype, record := range rule.records {
+							records[rtype] = append(records[rtype], record...)
 						}
-						if rule.final {
-							break
-						}
-					}
-				}
-
-				for _, rtype := range rtypes {
-					if qtype == strings.ToUpper(rtype) || qtype == "ANY" {
-						weights, responded := []int{}, false
-						for position, record := range records[rtype] {
-							if record.weight >= 0 {
-								for index := 0; index < record.weight; index++ {
-									weights = append(weights, position)
-								}
-							} else {
-								result = append(result, response(qname, rtype, record, rfields))
-								responded = true
-								if rtype == "cname" {
+						if rule.rematch != nil {
+							empty := false
+							for _, rtype := range rule.rematch.empty {
+								if len(records[rtype]) == 0 {
+									empty = true
 									break
 								}
 							}
-						}
-						if !responded && len(weights) > 0 {
-							position := 0
-							if affinity {
-								position = int(crc32.ChecksumIEEE([]byte(remote))) % len(weights)
-							} else {
-								position = rand.Int() % len(weights)
+							if empty {
+								exclude = append(exclude, rule.rematch.exclude...)
+								completed = false
+								break
 							}
-							result = append(result, response(qname, rtype, records[rtype][weights[position]], rfields))
+						}
+						affinity = rule.affinity
+						if rule.final {
+							break done
+						}
+					}
+				}
+				if completed {
+					break done
+				}
+			}
+
+			for _, rtype := range backendRTypes {
+				if strings.EqualFold(qtype, rtype) || qtype == "ANY" {
+					weights, responded := []int{}, false
+					for position, record := range records[rtype] {
+						if record.weight >= 0 {
+							for index := 0; index < record.weight; index++ {
+								weights = append(weights, position)
+							}
+
+						} else {
+							result = append(result, backendResponse(qname, rtype, record, rfields))
 							responded = true
+							if rtype == "cname" {
+								break
+							}
 						}
-						if responded && rtype == "cname" {
-							break
+					}
+					if !responded && len(weights) > 0 {
+						position := 0
+						if affinity {
+							position = int(crc32.ChecksumIEEE([]byte(remote))) % len(weights)
+
+						} else {
+							position = rand.Int() % len(weights)
 						}
+						result = append(result, backendResponse(qname, rtype, records[rtype][weights[position]], rfields))
+						responded = true
+					}
+					if responded && rtype == "cname" {
+						break
 					}
 				}
 			}
 		}
 	}
+
 	return
 }
 
-func backend(configuration string) error {
-	config, _ = uconfig.New(configuration)
-	logger = ulog.New("console()")
-	if config != nil {
-		logger.Load(config.GetString(progname+".log", "console()"))
-		loadCaches()
+func Backend(configuration string) (err error) {
+	config, err := uconfig.New(configuration)
+	if err != nil {
+		return err
 	}
-	go reload()
-	logger.Info(map[string]interface{}{"event": "start", "version": version, "configuration": configuration, "pid": os.Getpid()})
+	config.SetPrefix(PROGNAME)
 
-	if listen := config.GetString(progname+".listen", "_"); listen != "_" {
+	logger := ulog.New(config.String("log", "console()"))
+	logger.SetOrder([]string{
+		"pid", "scope", "event", "version", "config", "path", "description", "mode", "listen",
+		"certificate", "domain", "name", "reason", "retries", "id", "request", "response",
+	})
+	logger.Info(map[string]any{
+		"pid":     os.Getpid(),
+		"scope":   "backend",
+		"event":   "start",
+		"version": PROGVER,
+		"config":  configuration,
+	})
 
-		if _, _, err := net.SplitHostPort(listen); err == nil {
-			// remote HTTP backend
-			handler := http.NewServeMux()
-			handler.HandleFunc("/", func(response http.ResponseWriter, request *http.Request) {
+	go func() {
+		for {
+			backendReload(config, logger)
+			time.Sleep(5 * time.Second)
+		}
+	}()
+
+	if parts := strings.Fields(strings.Join(config.Strings("listen"), " ")); len(parts) != 0 && parts[0] != "" {
+		// remote backend
+		go func() {
+			mux := http.NewServeMux()
+			mux.HandleFunc("/", func(response http.ResponseWriter, request *http.Request) {
 				response.Header().Set("Content-Type", "application/json")
-				result := map[string]interface{}{"result": false}
-				if body, err := ioutil.ReadAll(request.Body); err == nil {
-					payload := map[string]interface{}{}
-					if json.Unmarshal(body, &payload) == nil {
-						switch jsonrpc.String(payload["method"]) {
-						case "initialize":
-							result["result"] = true
-						case "lookup":
-							MetricsCount("request", 1, map[string]interface{}{"mode": "http"})
-							qname, qtype, remote := "", "", ""
-							for name, value := range jsonrpc.StringMap(payload["parameters"]) {
-								switch name {
-								case "qname":
-									qname = strings.ToLower(strings.TrimRight(value, "."))
-								case "qtype":
-									qtype = value
-								case "real-remote":
-									remote = value
-								}
-							}
-							records := []map[string]interface{}{}
-							for _, line := range lookup(qname, qtype, remote) {
-								if fields := strings.Split(line, "\t"); len(fields) >= 7 {
-									scope, _ := strconv.Atoi(fields[0])
-									ttl, _ := strconv.Atoi(fields[5])
-									records = append(records, map[string]interface{}{
-										"scopeMask": scope,
-										"qname":     fields[2],
-										"qtype":     fields[4],
-										"ttl":       ttl,
-										"content":   strings.Join(fields[7:], "\t"),
-									})
-								}
-							}
-							result["result"] = records
+
+				result := map[string]any{"result": false}
+				body, _ := io.ReadAll(request.Body)
+				payload := map[string]any{}
+				json.Unmarshal(body, &payload)
+				if j.String(payload["method"]) == "lookup" {
+					qname, qtype, remote := "", "", ""
+					for name, value := range j.StringMap(payload["parameters"]) {
+						switch name {
+						case "qname":
+							qname = strings.ToLower(strings.TrimRight(value, "."))
+
+						case "qtype":
+							qtype = value
+
+						case "real-remote":
+							remote = value
 						}
 					}
+
+					if qname != "" && qtype != "" {
+						id, list := uuid.New(), [][]any{}
+						logger.Debug(map[string]any{
+							"pid":     os.Getpid(),
+							"scope":   "backend",
+							"event":   "request",
+							"mode":    "remote",
+							"id":      id.String(),
+							"request": []any{qname, qtype, remote},
+						})
+
+						records := []map[string]any{}
+						for _, line := range backendLookup(config, qname, qtype, remote) {
+							if fields := strings.Split(line, "\t"); len(fields) >= 7 {
+								scope, _ := strconv.Atoi(fields[0])
+								ttl, _ := strconv.Atoi(fields[5])
+								records = append(records, map[string]any{
+									"scopeMask": scope,
+									"qname":     fields[2],
+									"qtype":     fields[4],
+									"ttl":       ttl,
+									"content":   strings.Join(fields[7:], "\t"),
+								})
+								list = append(list, []any{fields[2], fields[4], ttl, strings.Join(fields[7:], " ")})
+							}
+						}
+						result["result"] = records
+
+						logger.Debug(map[string]any{
+							"pid":      os.Getpid(),
+							"scope":    "backend",
+							"event":    "response",
+							"mode":     "remote",
+							"id":       id.String(),
+							"response": list,
+						})
+					}
 				}
+
 				if payload, err := json.Marshal(result); err == nil {
 					response.Write(payload)
-					MetricsCount("response", 1, map[string]interface{}{"mode": "http"})
 				}
 			})
+
 			server := &http.Server{
-				Handler:           handler,
-				Addr:              strings.TrimLeft(listen, "*"),
-				IdleTimeout:       60 * time.Second,
-				ReadHeaderTimeout: 7 * time.Second,
-				ReadTimeout:       7 * time.Second,
-				WriteTimeout:      10 * time.Second,
+				Handler:      mux,
+				ErrorLog:     log.New(io.Discard, "", 0),
+				Addr:         strings.TrimLeft(parts[0], "*"),
+				ReadTimeout:  7 * time.Second,
+				WriteTimeout: 7 * time.Second,
+				IdleTimeout:  60 * time.Second,
 			}
-			logger.Info(map[string]interface{}{"event": "listen", "listen": listen, "mode": "http"})
-			for {
+			if len(parts) == 3 {
+				certificates := &dynacert.DYNACERT{}
+				certificates.Add("*", parts[1], parts[2])
+				server.TLSConfig = certificates.TLSConfig()
+				server.TLSNextProto = map[string]func(*http.Server, *tls.Conn, http.Handler){}
+			}
+
+			if server.TLSConfig != nil {
+				logger.Info(map[string]any{
+					"pid":         os.Getpid(),
+					"scope":       "backend",
+					"event":       "listen",
+					"mode":        "https",
+					"listen":      parts[0],
+					"certificate": parts[1:],
+				})
+				server.ListenAndServeTLS("", "")
+
+			} else {
+				logger.Info(map[string]any{
+					"pid":    os.Getpid(),
+					"scope":  "backend",
+					"event":  "listen",
+					"mode":   "http",
+					"listen": parts[0],
+				})
 				server.ListenAndServe()
-				time.Sleep(time.Second)
 			}
+		}()
+	}
+
+	// pipe backend
+	reader := bufio.NewReader(os.Stdin)
+	for {
+		if line, err := reader.ReadString('\n'); err != nil {
+			break
 
 		} else {
-			// remote unix socket backend
-			for {
-				os.Remove(listen)
-				if listener, err := net.Listen("unix", listen); err == nil {
-					os.Chmod(listen, 0666)
-					logger.Info(map[string]interface{}{"event": "listen", "listen": listen, "mode": "unix"})
-					for {
-						if handle, err := listener.Accept(); err == nil {
-							go func(handle net.Conn) {
-								body := make([]byte, 4<<10)
-								for {
-									if count, err := handle.Read(body); err == nil {
-										result, payload := map[string]interface{}{"result": false}, map[string]interface{}{}
-										if json.Unmarshal(body[:count], &payload) == nil {
-											switch jsonrpc.String(payload["method"]) {
-											case "initialize":
-												result["result"] = true
-											case "lookup":
-												MetricsCount("request", 1, map[string]interface{}{"mode": "unix"})
-												qname, qtype, remote := "", "", ""
-												for name, value := range jsonrpc.StringMap(payload["parameters"]) {
-													switch name {
-													case "qname":
-														qname = strings.ToLower(strings.TrimRight(value, "."))
-													case "qtype":
-														qtype = value
-													case "real-remote":
-														remote = value
-													}
-												}
-												records := []map[string]interface{}{}
-												for _, line := range lookup(qname, qtype, remote) {
-													if fields := strings.Split(line, "\t"); len(fields) >= 7 {
-														scope, _ := strconv.Atoi(fields[0])
-														ttl, _ := strconv.Atoi(fields[5])
-														records = append(records, map[string]interface{}{
-															"scopeMask": scope,
-															"qname":     fields[2],
-															"qtype":     fields[4],
-															"ttl":       ttl,
-															"content":   strings.Join(fields[7:], "\t"),
-														})
-													}
-												}
-												result["result"] = records
-											}
-										}
-										if payload, err := json.Marshal(result); err == nil {
-											handle.Write(payload)
-											MetricsCount("response", 1, map[string]interface{}{"mode": "unix"})
-										}
-										continue
-									}
-									break
-								}
-								handle.Close()
-							}(handle)
-						}
-					}
-					listener.Close()
-				}
-				time.Sleep(time.Second)
-			}
-		}
+			fields := strings.Split(strings.TrimSpace(line), "\t")
+			switch {
+			case len(fields) == 2 && fields[0] == "HELO":
+				if fields[1] != "3" {
+					os.Stdout.WriteString("FAIL invalid ABI version " + fields[1] + "\n")
 
-	} else {
-		// pipe backend
-		reader := bufio.NewReader(os.Stdin)
-		for {
-			if line, err := reader.ReadString('\n'); err != nil {
-				break
-			} else {
-				fields := strings.Split(strings.TrimSpace(line), "\t")
-				if len(fields) == 2 && fields[0] == "HELO" {
-					if fields[1] != "3" {
-						fmt.Printf("FAIL invalid ABI version %s\n", fields[1])
-					} else {
-						fmt.Printf("OK [%d] %s/%s ready\n", os.Getpid(), progname, version)
-					}
-				} else if len(fields) == 8 && fields[0] == "Q" && fields[2] == "IN" {
-					MetricsCount("request", 1, map[string]interface{}{"mode": "pipe"})
-					for _, line := range lookup(strings.ToLower(fields[1]), fields[3], fields[7]) {
-						if line != "" {
-							fmt.Printf("DATA\t%s\n", line)
+				} else {
+					os.Stdout.WriteString("OK " + strconv.Itoa(os.Getpid()) + " " + PROGNAME + "/" + PROGVER + " ready\n")
+				}
+
+			case len(fields) == 8 && fields[0] == "Q" && fields[2] == "IN":
+				if fields[1] != "" && fields[3] != "" {
+					id, list := uuid.New(), [][]any{}
+					logger.Debug(map[string]any{
+						"pid":     os.Getpid(),
+						"scope":   "backend",
+						"event":   "request",
+						"mode":    "pipe",
+						"id":      id.String(),
+						"request": []any{fields[1], fields[3], fields[7]},
+					})
+
+					for _, line := range backendLookup(config, strings.ToLower(fields[1]), fields[3], fields[7]) {
+						if fields := strings.Split(line, "\t"); len(fields) >= 7 {
+							os.Stdout.WriteString("DATA\t" + line + "\n")
+							ttl, _ := strconv.Atoi(fields[5])
+							list = append(list, []any{fields[2], fields[4], ttl, strings.Join(fields[7:], " ")})
 						}
 					}
-					fmt.Printf("END\n")
-					MetricsCount("response", 1, map[string]interface{}{"mode": "pipe"})
-				} else {
-					fmt.Printf("FAIL invalid backend request\n")
+
+					logger.Debug(map[string]any{
+						"pid":      os.Getpid(),
+						"scope":    "backend",
+						"event":    "response",
+						"mode":     "pipe",
+						"id":       id.String(),
+						"response": list,
+					})
 				}
+				os.Stdout.WriteString("END\n")
+
+			default:
+				os.Stdout.WriteString("FAIL invalid backend request\n")
 			}
 		}
 	}
 
-	logger.Info(map[string]interface{}{"event": "stop", "pid": os.Getpid(), "version": version, "configuration": configuration})
-	return nil
+	logger.Info(map[string]any{
+		"pid":     os.Getpid(),
+		"scope":   "backend",
+		"event":   "stop",
+		"version": PROGVER,
+		"config":  configuration,
+	})
+
+	return
 }

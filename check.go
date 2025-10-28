@@ -5,11 +5,12 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/json"
-	"fmt"
-	"io/ioutil"
+	"io"
+	"log"
 	"net"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -17,241 +18,308 @@ import (
 	"github.com/pyke369/golang-support/dynacert"
 	"github.com/pyke369/golang-support/rcache"
 	"github.com/pyke369/golang-support/uconfig"
+	"github.com/pyke369/golang-support/ulog"
 )
 
 type CHECK struct {
-	Last      int    `json:"last"`
+	Last      int64  `json:"last"`
 	State     string `json:"state"`
 	Latency   int    `json:"latency"`
-	Retries   int    `json:"retries"`
+	Retries   int    `json:"retries,omitempty"`
+	Reason    string `json:"reason,omitempty"`
+	Address   string `json:"address,omitempty"`
 	latencies []int
+	domain    string
 }
 
+type ADDRESS string
+
 var (
-	checks    = map[string]*CHECK{}
-	lock      sync.RWMutex
-	transport *http.Transport
+	checkTransport *http.Transport
+	checkMutex     sync.RWMutex
+	checkEntries   = map[string]*CHECK{}
 )
 
 func init() {
-	transport = http.DefaultTransport.(*http.Transport).Clone()
-	transport.DisableKeepAlives = true
-	transport.TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
-	transport.DialContext = func(context context.Context, network, address string) (net.Conn, error) {
-		if target := context.Value("address"); target != nil && target != "" {
+	checkTransport = http.DefaultTransport.(*http.Transport).Clone()
+	checkTransport.DisableKeepAlives = true
+	checkTransport.TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
+	checkTransport.DialContext = func(context context.Context, network, address string) (net.Conn, error) {
+		if target, ok := context.Value(ADDRESS("address")).(string); ok && target != "" {
 			if _, port, err := net.SplitHostPort(address); err == nil {
-				address = fmt.Sprintf("%s:%s", target, port)
+				address = target + ":" + port
 			}
 		}
 		return http.DefaultTransport.(*http.Transport).DialContext(context, network, address)
 	}
 }
 
-func do(name, method, url, payload string, headers map[string]string, cstatus, cheaders, cpayload string, csize, retries int, timeout time.Duration, metrics bool) {
-	var (
-		request *http.Request
-		address string
-		reason  string
-		pass    bool
-	)
+func checkRun(logger *ulog.ULog, name, method, url, payload string, headers map[string]string, cstatus, cheaders, cpayload string, csize, retries int, timeout time.Duration) {
+	var request *http.Request
 
-	start := time.Now()
-	if matcher := rcache.Get(`^(https?://)([^/]+)(.*)$`); matcher != nil {
-		if matches := matcher.FindStringSubmatch(url); matches != nil {
-			if parts := strings.Split(matches[2], "|"); len(parts) == 2 {
-				address, url = parts[0], matcher.ReplaceAllString(url, "${1}"+parts[1]+"${3}")
-			}
+	start, address, reason, pass, matcher := time.Now(), "", "", false, rcache.Get(`^(https?://)([^/]+)(.*)$`)
+	if captures := matcher.FindStringSubmatch(url); captures != nil {
+		if parts := strings.Split(captures[2], "|"); len(parts) == 2 {
+			address, url = parts[0], matcher.ReplaceAllString(url, "${1}"+parts[1]+"${3}")
 		}
 	}
 	if payload != "" {
 		request, _ = http.NewRequest(method, url, bytes.NewBuffer([]byte(payload)))
+
 	} else {
-		request, _ = http.NewRequest(method, url, nil)
+		request, _ = http.NewRequest(method, url, http.NoBody)
 	}
-	request = request.WithContext(context.WithValue(request.Context(), "address", address))
-	if request != nil {
-		if _, ok := headers["User-Agent"]; !ok {
-			request.Header.Add("User-Agent", fmt.Sprintf("%s/%s", progname, version))
-		}
-		if payload != "" {
-			request.Header.Add("Content-Length", fmt.Sprintf("%d", len(payload)))
-		}
-		for name, value := range headers {
-			request.Header.Add(name, value)
-		}
-		client := &http.Client{Transport: transport, Timeout: timeout}
-		if response, err := client.Do(request); err == nil {
-			pass = true
-			if cstatus != "" {
-				if matcher := rcache.Get(cstatus); matcher != nil && !matcher.MatchString(fmt.Sprintf("%d", response.StatusCode)) {
-					pass, reason = false, fmt.Sprintf("invalid status code (%d)", response.StatusCode)
-				}
-			}
-			if pass && cheaders != "" {
-				if matcher := rcache.Get(cheaders); matcher != nil {
-					pass, reason = false, "no matching header"
-					for name, _ := range response.Header {
-						if matcher.MatchString(fmt.Sprintf("%s: %s", name, response.Header.Get(name))) {
-							pass, reason = true, ""
-							break
-						}
-					}
-				}
-			}
-			if pass && (cpayload != "" || csize > 0) {
-				if payload, err := ioutil.ReadAll(response.Body); err == nil {
-					if cpayload != "" {
-						if matcher := rcache.Get(cpayload); matcher != nil && !matcher.Match(payload) {
-							pass, reason = false, "no matching payload"
-						}
-					}
-					if csize > 0 {
-						if csize > len(payload) {
-							pass, reason = false, fmt.Sprintf("payload too small (%d)", len(payload))
-						}
-					}
-				}
-			}
-			response.Body.Close()
-		} else {
-			pass, reason = false, fmt.Sprintf("%v", err)
-		}
+	if request == nil {
+		return
+	}
+	request = request.WithContext(context.WithValue(request.Context(), ADDRESS("address"), address))
+	if request == nil {
+		return
+	}
+	if _, exists := headers["User-Agent"]; !exists {
+		request.Header.Add("User-Agent", PROGNAME+"/"+PROGVER)
+	}
+	if payload != "" {
+		request.Header.Add("Content-Length", strconv.Itoa(len(payload)))
+	}
+	for key, value := range headers {
+		request.Header.Add(key, value)
 	}
 
-	lock.Lock()
-	if _, ok := checks[name]; !ok {
-		checks[name] = &CHECK{0, "up", 0, 0, []int{}}
-	}
-	checks[name].Last = int(time.Now().Unix())
-	checks[name].latencies = append(checks[name].latencies, int(time.Now().Sub(start)/time.Millisecond))
-	if len(checks[name].latencies) > 5 {
-		for index := 0; index < 5; index++ {
-			checks[name].latencies[index] = checks[name].latencies[index+1]
+	client := &http.Client{Transport: checkTransport, Timeout: timeout}
+	if response, err := client.Do(request); err == nil {
+		pass = true
+		if cstatus != "" {
+			if matcher := rcache.Get(cstatus); matcher != nil && !matcher.MatchString(strconv.Itoa(response.StatusCode)) {
+				pass, reason = false, "invalid status code "+strconv.Itoa(response.StatusCode)
+			}
 		}
-		checks[name].latencies = checks[name].latencies[:5]
+		if pass && cheaders != "" {
+			if matcher := rcache.Get(cheaders); matcher != nil {
+				pass, reason = false, "no matching header"
+				for key := range response.Header {
+					if matcher.MatchString(key + ": " + response.Header.Get(key)) {
+						pass, reason = true, ""
+						break
+					}
+				}
+			}
+		}
+		if pass && (cpayload != "" || csize > 0) {
+			if payload, err := io.ReadAll(response.Body); err == nil {
+				if cpayload != "" {
+					if matcher := rcache.Get(cpayload); matcher != nil && !matcher.Match(payload) {
+						pass, reason = false, "no matching payload"
+					}
+				}
+				if csize > 0 {
+					if csize > len(payload) {
+						pass, reason = false, "payload too small "+strconv.Itoa(len(payload))
+					}
+				}
+			}
+		}
+		response.Body.Close()
+
+	} else {
+		pass, reason = false, err.Error()
+	}
+
+	checkMutex.RLock()
+	entry, exists := checkEntries[name]
+	checkMutex.RUnlock()
+	if !exists {
+		return
+	}
+
+	entry.Last, entry.Reason, entry.Address = time.Now().Unix(), reason, address
+	entry.latencies = append(entry.latencies, int(time.Since(start)/time.Millisecond))
+	if len(entry.latencies) > 5 {
+		for index := 0; index < 5; index++ {
+			entry.latencies[index] = entry.latencies[index+1]
+		}
+		entry.latencies = entry.latencies[:5]
 	}
 	latency, divider := 0, 0
-	for index := 0; index < len(checks[name].latencies); index++ {
-		latency += checks[name].latencies[index] * (index + 1)
+	for index := 0; index < len(entry.latencies); index++ {
+		latency += entry.latencies[index] * (index + 1)
 		divider += (index + 1)
 	}
-	checks[name].Latency = latency / divider
-	if checks[name].State == "up" {
+	entry.Latency = latency / divider
+	if entry.State == "up" {
 		if pass {
-			checks[name].Retries = 0
+			entry.Retries = 0
+
 		} else {
-			checks[name].Retries++
-			logger.Info(map[string]interface{}{"event": "fall", "pid": os.Getpid(), "check": name,
-				"reason": reason, "retries": fmt.Sprintf("%d/%d", checks[name].Retries, retries)})
-			if checks[name].Retries >= retries {
-				checks[name].State = "down"
-				checks[name].Retries = 0
-				logger.Info(map[string]interface{}{"event": "down", "pid": os.Getpid(), "check": name})
+			entry.Retries++
+			logger.Info(map[string]any{
+				"pid":     os.Getpid(),
+				"scope":   "check",
+				"event":   "fall",
+				"domain":  entry.domain,
+				"name":    name,
+				"reason":  reason,
+				"retries": strconv.Itoa(entry.Retries) + "/" + strconv.Itoa(retries),
+			})
+			if entry.Retries >= retries {
+				entry.State, entry.Retries = "down", 0
+				logger.Info(map[string]any{
+					"pid":    os.Getpid(),
+					"scope":  "check",
+					"event":  "down",
+					"domain": entry.domain,
+					"name":   name,
+				})
 			}
 		}
+
 	} else {
 		if pass {
-			checks[name].Retries++
-			logger.Info(map[string]interface{}{"event": "rise", "pid": os.Getpid(), "check": name,
-				"retries": fmt.Sprintf("%d/%d", checks[name].Retries, retries)})
-			if checks[name].Retries >= retries {
-				checks[name].State = "up"
-				checks[name].Retries = 0
-				logger.Info(map[string]interface{}{"event": "up", "pid": os.Getpid(), "check": name})
+			entry.Retries++
+			logger.Info(map[string]any{
+				"pid":     os.Getpid(),
+				"scope":   "check",
+				"event":   "rise",
+				"domain":  entry.domain,
+				"name":    name,
+				"retries": strconv.Itoa(entry.Retries) + "/" + strconv.Itoa(retries),
+			})
+			if entry.Retries >= retries {
+				entry.State, entry.Retries = "up", 0
+				logger.Info(map[string]any{
+					"pid":    os.Getpid(),
+					"scope":  "check",
+					"event":  "up",
+					"domain": entry.domain,
+					"name":   name,
+				})
 			}
+
 		} else {
-			checks[name].Retries = 0
+			entry.Retries = 0
 		}
 	}
-	if metrics {
-		MetricsGauge("state", int64(-strings.Index(checks[name].State, "down")), map[string]interface{}{"check": name})
-		MetricsGauge("latency", int64(checks[name].Latency), map[string]interface{}{"check": name})
-	}
-	lock.Unlock()
 }
 
-func check(listen string) {
+func Check(config *uconfig.UConfig, logger *ulog.ULog) {
 	exit := make(chan bool)
-
 	go func() {
-		lock.Lock()
-		for _, path1 := range config.GetPaths("domains") {
-			for _, path2 := range config.GetPaths(path1 + ".checks") {
-				name := strings.TrimPrefix(path2, path1+".checks.")
-				if _, ok := checks[name]; !ok {
-					checks[name] = &CHECK{0, "up", 0, 0, []int{}}
-					logger.Info(map[string]interface{}{"event": "add", "pid": os.Getpid(), "check": name})
+		time.Sleep(time.Second)
+		select {
+		case <-exit:
+			return
+
+		default:
+		}
+
+		checkMutex.Lock()
+		for _, dpath := range config.Paths("domains") {
+			for _, cpath := range config.Paths(config.Path(dpath, "checks")) {
+				name := config.Base(cpath)
+				if _, exists := checkEntries[name]; !exists {
+					domain := config.String(config.Path(dpath, "name"))
+					checkEntries[name] = &CHECK{Last: 0, State: "up", Latency: 0, Retries: 0, latencies: []int{}, domain: domain}
+					logger.Info(map[string]any{
+						"pid":    os.Getpid(),
+						"scope":  "check",
+						"event":  "add",
+						"domain": domain,
+						"name":   name,
+					})
 				}
 			}
 		}
-		for name, check := range checks {
-			if check.Last != 0 && int(time.Now().Unix())-check.Last >= 30 {
-				delete(checks, name)
-				logger.Info(map[string]interface{}{"event": "remove", "pid": os.Getpid(), "check": name})
-			}
-		}
-		lock.Unlock()
+		checkMutex.Unlock()
 
-		ticker := time.NewTicker(uconfig.Duration(config.GetDurationBounds(progname+".checks.frequency", 10, 2, 60)))
 		for {
 			select {
-			case <-ticker.C:
-				for _, path1 := range config.GetPaths("domains") {
-					for _, path2 := range config.GetPaths(path1 + ".checks") {
-						if url := strings.TrimSpace(config.GetString(path2+".target.url", "")); url != "" {
+			case <-time.Tick(config.DurationBounds(config.Path("check", "frequency"), 7, 2, 60)):
+				checkMutex.Lock()
+				for _, dpath := range config.Paths("domains") {
+					for _, cpath := range config.Paths(config.Path(dpath, "checks")) {
+						name := config.Base(cpath)
+						if _, exists := checkEntries[name]; !exists {
+							domain := config.String(config.Path(dpath, "name"))
+							checkEntries[name] = &CHECK{Last: 0, State: "up", Latency: 0, Retries: 0, latencies: []int{}, domain: domain}
+							logger.Info(map[string]any{
+								"pid":    os.Getpid(),
+								"scope":  "check",
+								"event":  "add",
+								"domain": domain,
+								"name":   name,
+							})
+						}
+						if url := strings.TrimSpace(config.String(config.Path(cpath, "target", "url"))); url != "" {
 							headers := map[string]string{}
-							for _, path3 := range config.GetPaths(path2 + ".target.headers") {
-								headers[strings.TrimPrefix(path3, path2+".target.headers.")] = config.GetString(path3, "")
+							for _, path3 := range config.Paths(config.Path(cpath, "target", "headers")) {
+								headers[config.Base(path3)] = config.String(path3)
 							}
-							go do(strings.TrimPrefix(path2, path1+".checks."),
-								config.GetStringMatch(path2+".target.method", http.MethodGet, "^(OPTIONS|HEAD|GET|PUT|POST|PATCH|DELETE)$"),
+							go checkRun(
+								logger,
+								config.Base(cpath),
+								config.StringMatch(config.Path(cpath, "target", "method"), http.MethodGet, "^(OPTIONS|HEAD|GET|PUT|POST|PATCH|DELETE)$"),
 								url,
-								config.GetString(path2+".target.payload", ""),
+								config.String(config.Path(cpath, "target", "payload")),
 								headers,
-								config.GetString(path2+".status", `^2\d{2}$`),
-								config.GetString(path2+".headers", ""),
-								config.GetString(path2+".content", ""),
-								int(config.GetInteger(path2+".size", 0)),
-								int(config.GetIntegerBounds(path2+".retries", 3, 1, 5)),
-								uconfig.Duration(config.GetDurationBounds(path2+".timeout", 3, 1, 9)),
-								config.GetBoolean(path2+".metrics", true),
+								config.String(config.Path(cpath, "status"), `^2\d{2}$`),
+								config.String(config.Path(cpath, "headers")),
+								config.String(config.Path(cpath, "content")),
+								int(config.Integer(config.Path(cpath, "size"))),
+								int(config.IntegerBounds(config.Path(cpath, "retries"), 3, 1, 5)),
+								config.DurationBounds(config.Path(cpath, "timeout"), 5, 1, 9),
 							)
 						}
 					}
 				}
+				for name, entry := range checkEntries {
+					if entry.Last != 0 && time.Now().Unix()-entry.Last >= 30 {
+						delete(checkEntries, name)
+						logger.Info(map[string]any{
+							"pid":    os.Getpid(),
+							"scope":  "check",
+							"event":  "remove",
+							"domain": entry.domain,
+							"name":   name,
+						})
+					}
+				}
+				checkMutex.Unlock()
+
 			case <-exit:
 				return
 			}
 		}
-		ticker.Stop()
 	}()
 
-	handler := http.NewServeMux()
-	handler.HandleFunc("/checks", func(response http.ResponseWriter, request *http.Request) {
-		lock.RLock()
-		content, _ := json.Marshal(checks)
-		lock.RUnlock()
-		response.Write(content)
-	})
+	if parts := strings.Fields(strings.Join(config.Strings(config.Path("check", "listen")), " ")); len(parts) != 0 && parts[0] != "" {
+		mux := http.NewServeMux()
+		mux.HandleFunc("/check", func(response http.ResponseWriter, request *http.Request) {
+			checkMutex.RLock()
+			content, _ := json.Marshal(checkEntries)
+			checkMutex.RUnlock()
+			response.Write(content)
+		})
 
-	if parts := strings.Split(listen, ","); parts[0] != "" {
 		server := &http.Server{
+			Handler:      mux,
+			ErrorLog:     log.New(io.Discard, "", 0),
 			Addr:         strings.TrimLeft(parts[0], "*"),
-			ReadTimeout:  uconfig.Duration(config.GetDurationBounds(progname+".read_timeout", 10, 5, 30)),
-			WriteTimeout: uconfig.Duration(config.GetDurationBounds(progname+".write_timeout", 10, 5, 30)),
-			IdleTimeout:  uconfig.Duration(config.GetDurationBounds(progname+".idle_timeout", 30, 5, 30)),
-			Handler:      handler,
+			ReadTimeout:  7 * time.Second,
+			WriteTimeout: 7 * time.Second,
+			IdleTimeout:  60 * time.Second,
 		}
-		if len(parts) > 1 {
-			loader := &dynacert.DYNACERT{Public: parts[1], Key: parts[2]}
-			server.TLSConfig = dynacert.IntermediateTLSConfig(loader.GetCertificate)
+		if len(parts) == 3 {
+			certificates := &dynacert.DYNACERT{}
+			certificates.Add("*", parts[1], parts[2])
+			server.TLSConfig = certificates.TLSConfig()
 			server.TLSNextProto = map[string]func(*http.Server, *tls.Conn, http.Handler){}
-			server.ListenAndServeTLS(parts[1], parts[2])
+		}
+		if server.TLSConfig != nil {
+			server.ListenAndServeTLS("", "")
 		} else {
 			server.ListenAndServe()
 		}
 	}
 
 	close(exit)
-	time.Sleep(time.Second)
 }
